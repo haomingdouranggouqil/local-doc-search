@@ -1,0 +1,9 @@
+services:
+  backend:
+    environment:
+      OCR_ENGINE: api
+      OCR_DEVICE: api
+  worker:
+    environment:
+      OCR_ENGINE: api
+      OCR_DEVICE: api

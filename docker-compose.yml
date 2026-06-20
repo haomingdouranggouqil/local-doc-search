@@ -1,0 +1,102 @@
+name: local-doc-search
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: local-doc-search-backend
+    container_name: local-doc-search-backend
+    restart: unless-stopped
+    environment:
+      APP_ROLE: api
+      DOCUMENT_ROOT: /library
+      STATE_DIR: /data
+      OCR_ENGINE: ${OCR_ENGINE:-api}
+      OCR_VERSION: ${OCR_VERSION:-PP-OCRv6}
+      OCR_DEVICE: ${OCR_DEVICE:-api}
+      PADDLEOCR_API_URL: ${PADDLEOCR_API_URL:-https://paddleocr.aistudio-app.com/api/v2/ocr/jobs}
+      PADDLEOCR_API_TOKEN: ${PADDLEOCR_API_TOKEN:-}
+      PADDLEOCR_API_MODEL: ${PADDLEOCR_API_MODEL:-PP-OCRv6}
+      PADDLEOCR_API_POLL_SECONDS: ${PADDLEOCR_API_POLL_SECONDS:-5}
+      PADDLEOCR_API_TIMEOUT_SECONDS: ${PADDLEOCR_API_TIMEOUT_SECONDS:-7200}
+      PADDLEOCR_API_REQUEST_TIMEOUT_SECONDS: ${PADDLEOCR_API_REQUEST_TIMEOUT_SECONDS:-300}
+      PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY: ${PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY:-false}
+      PADDLEOCR_USE_DOC_UNWARPING: ${PADDLEOCR_USE_DOC_UNWARPING:-false}
+      PADDLEOCR_USE_TEXTLINE_ORIENTATION: ${PADDLEOCR_USE_TEXTLINE_ORIENTATION:-false}
+      OCR_MIN_TEXT_CHARS: ${OCR_MIN_TEXT_CHARS:-80}
+      OCR_MAX_PAGES: ${OCR_MAX_PAGES:-0}
+      MAX_FILE_MB: ${MAX_FILE_MB:-0}
+      MAX_OUTPUT_PDF_MB: ${MAX_OUTPUT_PDF_MB:-0}
+      RESOURCE_AUTO_TUNE: ${RESOURCE_AUTO_TUNE:-true}
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-20}
+      EXCLUDE_DIRS: ${EXCLUDE_DIRS:-.docsearch,.git,.svn,node_modules,__pycache__,.pytest_cache,.venv,venv}
+      EXCLUDE_PATHS: ${EXCLUDE_PATHS:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-120}
+      DEEPSEEK_MAX_CHARS: ${DEEPSEEK_MAX_CHARS:-60000}
+      PUBLICATION_EXTRACT_ENABLED: ${PUBLICATION_EXTRACT_ENABLED:-true}
+      LOCAL_OPEN_ENABLED: ${LOCAL_OPEN_ENABLED:-true}
+    volumes:
+      - type: bind
+        source: ./data
+        target: /library
+      - type: bind
+        source: ./.docsearch
+        target: /data
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: ./backend
+    image: local-doc-search-backend
+    container_name: local-doc-search-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DOCUMENT_ROOT: /library
+      STATE_DIR: /data
+      OCR_ENGINE: ${OCR_ENGINE:-api}
+      OCR_VERSION: ${OCR_VERSION:-PP-OCRv6}
+      OCR_DEVICE: ${OCR_DEVICE:-api}
+      PADDLEOCR_API_URL: ${PADDLEOCR_API_URL:-https://paddleocr.aistudio-app.com/api/v2/ocr/jobs}
+      PADDLEOCR_API_TOKEN: ${PADDLEOCR_API_TOKEN:-}
+      PADDLEOCR_API_MODEL: ${PADDLEOCR_API_MODEL:-PP-OCRv6}
+      PADDLEOCR_API_POLL_SECONDS: ${PADDLEOCR_API_POLL_SECONDS:-5}
+      PADDLEOCR_API_TIMEOUT_SECONDS: ${PADDLEOCR_API_TIMEOUT_SECONDS:-7200}
+      PADDLEOCR_API_REQUEST_TIMEOUT_SECONDS: ${PADDLEOCR_API_REQUEST_TIMEOUT_SECONDS:-300}
+      PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY: ${PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY:-false}
+      PADDLEOCR_USE_DOC_UNWARPING: ${PADDLEOCR_USE_DOC_UNWARPING:-false}
+      PADDLEOCR_USE_TEXTLINE_ORIENTATION: ${PADDLEOCR_USE_TEXTLINE_ORIENTATION:-false}
+      OCR_MIN_TEXT_CHARS: ${OCR_MIN_TEXT_CHARS:-80}
+      OCR_MAX_PAGES: ${OCR_MAX_PAGES:-0}
+      MAX_FILE_MB: ${MAX_FILE_MB:-0}
+      MAX_OUTPUT_PDF_MB: ${MAX_OUTPUT_PDF_MB:-0}
+      RESOURCE_AUTO_TUNE: ${RESOURCE_AUTO_TUNE:-true}
+      EXCLUDE_DIRS: ${EXCLUDE_DIRS:-.docsearch,.git,.svn,node_modules,__pycache__,.pytest_cache,.venv,venv}
+      EXCLUDE_PATHS: ${EXCLUDE_PATHS:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-120}
+      DEEPSEEK_MAX_CHARS: ${DEEPSEEK_MAX_CHARS:-60000}
+      PUBLICATION_EXTRACT_ENABLED: ${PUBLICATION_EXTRACT_ENABLED:-true}
+    volumes:
+      - type: bind
+        source: ./data
+        target: /library
+      - type: bind
+        source: ./.docsearch
+        target: /data
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: local-doc-search-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8517:80"
