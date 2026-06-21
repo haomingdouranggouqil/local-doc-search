@@ -5,8 +5,14 @@ import threading
 import time
 from pathlib import Path
 
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ModuleNotFoundError:
+    class FileSystemEventHandler:
+        pass
+
+    Observer = None
 
 from .config import Settings
 from .database import Database
@@ -20,11 +26,12 @@ class DocumentScanner:
         self.db = db
         self.resources = resources
 
-    def scan_once(self) -> dict[str, int]:
+    def scan_once(self, retry_failed: bool = False) -> dict[str, int]:
         root = self.settings.document_root.resolve()
         seen: set[str] = set()
         added_or_changed = 0
         skipped = 0
+        requeued = 0
 
         if not root.exists():
             root.mkdir(parents=True, exist_ok=True)
@@ -85,9 +92,17 @@ class DocumentScanner:
                 added_or_changed += 1
                 self.db.enqueue_job(document_id)
                 self.db.record_event("change", f"Changed: {rel_path}", document_id, rel_path)
+            elif retry_failed and self.db.requeue_unsuccessful_document(document_id):
+                requeued += 1
+                self.db.record_event("retry", f"Requeued failed document: {rel_path}", document_id, rel_path)
 
         deleted = self.db.mark_missing_deleted(seen)
-        return {"changed": added_or_changed, "deleted": deleted, "skipped": skipped}
+        return {
+            "changed": added_or_changed,
+            "deleted": deleted,
+            "skipped": skipped,
+            "requeued": requeued,
+        }
 
     def categories(self) -> list[dict[str, str]]:
         root = self.settings.document_root.resolve()
@@ -151,6 +166,10 @@ class DebouncedScanHandler(FileSystemEventHandler):
 
 def run_scan_loop(scanner: DocumentScanner, stop_event: threading.Event) -> None:
     scanner.scan_once()
+    if Observer is None:
+        while not stop_event.wait(scanner.settings.scan_interval_seconds):
+            scanner.scan_once()
+        return
     handler = DebouncedScanHandler(scanner.scan_once, scanner.settings.scan_debounce_seconds)
     observer = Observer()
     observer.schedule(handler, str(scanner.settings.document_root), recursive=True)

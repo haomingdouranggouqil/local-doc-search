@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -9,16 +10,18 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .config import get_settings
 from .database import Database
 from .indexer import DocumentIndexer
+from .pdf_preview import render_highlighted_page_png
+from .quota import current_quota_day
 from .resources import ResourcePolicy
 from .scanner import DocumentScanner, run_scan_loop, run_worker_loop
 
 settings = get_settings()
-db = Database(settings.db_path)
+db = Database(settings.db_path, settings.sqlite_journal_mode)
 resources = ResourcePolicy(settings)
 scanner = DocumentScanner(settings, db, resources)
 indexer = DocumentIndexer(settings, db, resources)
@@ -65,30 +68,71 @@ def health() -> dict[str, Any]:
 @app.get("/api/stats")
 def stats() -> dict[str, Any]:
     data = db.stats()
+    quota_day = current_quota_day(settings.paddleocr_quota_timezone)
+    quota_usage = db.ocr_usage_for_day(quota_day.date, quota_day.start_utc, quota_day.end_utc)
+    daily_limit = max(0, int(settings.paddleocr_daily_page_limit or 0))
+    used_pages = int(quota_usage["used_pages"])
     data["ocr"] = {
         "engine": settings.ocr_engine,
         "model": settings.paddleocr_api_model,
         "configured_device": settings.ocr_device,
         "actual_device": indexer.ocr_engine.actual_device,
+        "quota": {
+            "date": quota_day.date,
+            "timezone": quota_day.timezone,
+            "used_pages": used_pages,
+            "daily_limit_pages": daily_limit,
+            "remaining_pages": max(0, daily_limit - used_pages) if daily_limit else None,
+            "source": quota_usage["source"],
+        },
     }
     data["resources"] = resources.as_dict()
     return data
 
 
 @app.post("/api/scan")
-def scan() -> dict[str, int]:
-    return scanner.scan_once()
+def scan(retry_failed: bool = Query(default=False)) -> dict[str, int]:
+    return scanner.scan_once(retry_failed=retry_failed)
 
 
 @app.get("/api/search")
 def search(
     q: str = Query(default="", min_length=1),
     scope: str = Query(default=""),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    rows = db.search(q, limit=limit, offset=offset, scope=scope)
-    return {"query": q, "scope": scope, "results": [dict(row) for row in rows], "count": len(rows)}
+    page = db.search_page(q, limit=limit, offset=offset, scope=scope)
+    return {
+        "query": q,
+        "scope": scope,
+        **page,
+        "results": [dict(row) for row in page["results"]],
+    }
+
+
+@app.get("/api/search/groups")
+def search_groups(
+    q: str = Query(default="", min_length=1),
+    scope: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    page = db.search_groups_page(q, limit=limit, offset=offset, scope=scope)
+    return {"query": q, "scope": scope, **page}
+
+
+@app.get("/api/search/document/{document_id}")
+def search_document(
+    document_id: str,
+    q: str = Query(default="", min_length=1),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    if db.get_document(document_id) is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    page = db.search_document_page(q, document_id=document_id, limit=limit, offset=offset)
+    return {"query": q, "document_id": document_id, **page}
 
 
 @app.get("/api/categories")
@@ -155,14 +199,43 @@ def pdf_file(document_id: str):
     row = db.get_document(document_id)
     if row is None:
         raise HTTPException(status_code=404, detail="document not found")
-    candidate = row["searchable_pdf"] or (row["path"] if row["ext"] == ".pdf" else None)
-    if not candidate:
-        raise HTTPException(status_code=404, detail="pdf preview not available")
-    path = Path(candidate)
-    ensure_allowed(path, allow_state=True)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="pdf missing")
-    return FileResponse(path, filename=path.name, media_type="application/pdf")
+    path = pdf_preview_path(row)
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="application/pdf",
+        content_disposition_type="inline",
+    )
+
+
+@app.get("/api/files/{document_id}/page-image")
+def pdf_page_image(
+    document_id: str,
+    page: int = Query(ge=1),
+    match_id: int | None = Query(default=None),
+    q: str = Query(default=""),
+):
+    row = db.get_document(document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    path = pdf_preview_path(row)
+    match_chunk = db.get_chunk(document_id, match_id) if match_id is not None else None
+    page_chunks = db.chunks_for_page(document_id, page)
+    try:
+        image = render_highlighted_page_png(
+            path,
+            page,
+            match_chunk=match_chunk,
+            page_chunks=page_chunks,
+            query=q,
+        )
+    except IndexError:
+        raise HTTPException(status_code=404, detail="pdf page not found")
+    return Response(
+        content=image,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/jobs")
@@ -182,6 +255,17 @@ def ensure_allowed(path: Path, allow_state: bool = False) -> None:
         roots.append(settings.state_dir.resolve())
     if not any(resolved == root or root in resolved.parents for root in roots):
         raise HTTPException(status_code=403, detail="path is outside allowed roots")
+
+
+def pdf_preview_path(row) -> Path:
+    candidate = row["searchable_pdf"] or (row["path"] if row["ext"] == ".pdf" else None)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="pdf preview not available")
+    path = Path(candidate)
+    ensure_allowed(path, allow_state=True)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="pdf missing")
+    return path
 
 
 def open_with_system(path: Path) -> dict[str, Any]:
@@ -212,32 +296,5 @@ def open_windows_file(path: Path) -> dict[str, Any]:
         )
         return {"method": "notepad", "pid": process.pid}
 
-    script = (
-        "$target = $args[0]; "
-        "$process = Start-Process -FilePath $target -WindowStyle Normal -PassThru; "
-        "if ($process) { $process.Id }"
-    )
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or "Start-Process failed"
-        raise RuntimeError(message)
-
-    pid_text = completed.stdout.strip().splitlines()
-    return {
-        "method": "powershell-start-process",
-        "pid": int(pid_text[-1]) if pid_text and pid_text[-1].isdigit() else None,
-    }
+    os.startfile(str(path))
+    return {"method": "windows-startfile", "pid": None}

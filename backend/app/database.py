@@ -19,8 +19,9 @@ def now_iso() -> str:
 
 
 class Database:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, journal_mode: str = "DELETE"):
         self.path = path
+        self.journal_mode = normalize_journal_mode(journal_mode)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.init()
@@ -29,9 +30,8 @@ class Database:
     def connect(self):
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA foreign_keys=ON")
         con.execute("PRAGMA busy_timeout=30000")
+        con.execute("PRAGMA foreign_keys=ON")
         try:
             yield con
             con.commit()
@@ -43,6 +43,7 @@ class Database:
 
     def init(self) -> None:
         with self._lock, self.connect() as con:
+            self._configure_journal_mode(con)
             con.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS meta (
@@ -118,6 +119,12 @@ class Database:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS ocr_usage_daily (
+                    usage_date TEXT PRIMARY KEY,
+                    pages INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_document_columns(con)
@@ -166,6 +173,20 @@ class Database:
                 )
             if self._meta_value(con, "text_extractor_version") != TEXT_EXTRACTOR_VERSION:
                 self._requeue_text_documents(con)
+            self._cancel_deleted_document_jobs(con)
+
+    def _configure_journal_mode(self, con: sqlite3.Connection) -> None:
+        if not self.journal_mode:
+            return
+        try:
+            con.execute(f"PRAGMA journal_mode={self.journal_mode}")
+        except sqlite3.OperationalError:
+            if self.journal_mode == "DELETE":
+                return
+            try:
+                con.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.OperationalError:
+                return
 
     def _fts_exists(self, con: sqlite3.Connection) -> bool:
         row = con.execute(
@@ -372,8 +393,6 @@ class Database:
                     ts,
                 ),
             )
-            if changed:
-                self._delete_chunks(con, doc["id"])
             return changed
 
     def upsert_skipped_document(self, doc: dict[str, Any], error: str) -> bool:
@@ -485,6 +504,7 @@ class Database:
                     """,
                     (row["id"], row["rel_path"], f"Deleted: {row['rel_path']}", now_iso()),
                 )
+                self._cancel_document_jobs(con, row["id"], now_iso())
                 deleted += 1
             return deleted
 
@@ -511,6 +531,44 @@ class Database:
                 "UPDATE documents SET status = 'queued', updated_at = ? WHERE id = ?",
                 (ts, document_id),
             )
+
+    def requeue_unsuccessful_document(self, document_id: str) -> bool:
+        ts = now_iso()
+        with self._lock, self.connect() as con:
+            row = con.execute(
+                """
+                SELECT id, status FROM documents
+                WHERE id = ? AND deleted = 0 AND status IN ('error', 'empty')
+                """,
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            existing = con.execute(
+                """
+                SELECT id FROM jobs
+                WHERE document_id = ? AND type = 'index' AND status IN ('queued', 'processing')
+                """,
+                (document_id,),
+            ).fetchone()
+            if existing is not None:
+                return False
+            con.execute(
+                """
+                INSERT INTO jobs(document_id, type, status, priority, message, created_at, updated_at)
+                VALUES(?, 'index', 'queued', 90, 'Retry failed document', ?, ?)
+                """,
+                (document_id, ts, ts),
+            )
+            con.execute(
+                """
+                UPDATE documents
+                SET status = 'queued', error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (ts, document_id),
+            )
+            return True
 
     def claim_next_job(self) -> sqlite3.Row | None:
         ts = now_iso()
@@ -545,6 +603,7 @@ class Database:
     def requeue_interrupted_jobs(self) -> int:
         ts = now_iso()
         with self._lock, self.connect() as con:
+            self._cancel_deleted_document_jobs(con, ts)
             rows = list(
                 con.execute(
                     """
@@ -568,8 +627,41 @@ class Database:
                 con.execute(
                     "UPDATE documents SET status='queued', updated_at=? WHERE id=?",
                     (ts, row["document_id"]),
-                )
+            )
             return len(rows)
+
+    def _cancel_deleted_document_jobs(
+        self, con: sqlite3.Connection, ts: str | None = None
+    ) -> int:
+        ts = ts or now_iso()
+        cur = con.execute(
+            """
+            UPDATE jobs
+            SET status='cancelled', progress=1, message='Cancelled because document was deleted',
+                error=NULL, updated_at=?, finished_at=COALESCE(finished_at, ?)
+            WHERE status IN ('queued', 'processing')
+              AND document_id IN (
+                  SELECT id FROM documents WHERE deleted = 1
+              )
+            """,
+            (ts, ts),
+        )
+        return int(cur.rowcount or 0)
+
+    def _cancel_document_jobs(
+        self, con: sqlite3.Connection, document_id: str, ts: str | None = None
+    ) -> int:
+        ts = ts or now_iso()
+        cur = con.execute(
+            """
+            UPDATE jobs
+            SET status='cancelled', progress=1, message='Cancelled because document was deleted',
+                error=NULL, updated_at=?, finished_at=COALESCE(finished_at, ?)
+            WHERE document_id = ? AND status IN ('queued', 'processing')
+            """,
+            (ts, ts, document_id),
+        )
+        return int(cur.rowcount or 0)
 
     def update_job(
         self,
@@ -669,6 +761,89 @@ class Database:
                 ),
             )
 
+    def record_ocr_usage(
+        self,
+        usage_date: str,
+        pages: int,
+        day_start_utc: str,
+        day_end_utc: str,
+    ) -> None:
+        page_count = max(0, int(pages or 0))
+        if page_count <= 0:
+            return
+
+        ts = now_iso()
+        with self._lock, self.connect() as con:
+            existing = con.execute(
+                "SELECT pages FROM ocr_usage_daily WHERE usage_date = ?",
+                (usage_date,),
+            ).fetchone()
+            if existing is None:
+                baseline = self._daily_indexed_pdf_pages(con, day_start_utc, day_end_utc)
+                con.execute(
+                    """
+                    INSERT INTO ocr_usage_daily(usage_date, pages, updated_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(usage_date) DO UPDATE SET
+                        pages = pages + ?,
+                        updated_at = excluded.updated_at
+                    """,
+                    (usage_date, baseline + page_count, ts, page_count),
+                )
+                return
+
+            con.execute(
+                """
+                UPDATE ocr_usage_daily
+                SET pages = pages + ?, updated_at = ?
+                WHERE usage_date = ?
+                """,
+                (page_count, ts, usage_date),
+            )
+
+    def ocr_usage_for_day(
+        self,
+        usage_date: str,
+        day_start_utc: str,
+        day_end_utc: str,
+    ) -> dict[str, Any]:
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT pages, updated_at FROM ocr_usage_daily WHERE usage_date = ?",
+                (usage_date,),
+            ).fetchone()
+            logged_pages = int(row["pages"] or 0) if row else 0
+            indexed_pages = self._daily_indexed_pdf_pages(con, day_start_utc, day_end_utc)
+            used_pages = max(logged_pages, indexed_pages)
+            source = "usage_log" if row and logged_pages >= indexed_pages else "documents"
+            return {
+                "used_pages": used_pages,
+                "logged_pages": logged_pages,
+                "indexed_pages": indexed_pages,
+                "source": source,
+                "updated_at": row["updated_at"] if row else None,
+            }
+
+    def _daily_indexed_pdf_pages(
+        self,
+        con: sqlite3.Connection,
+        day_start_utc: str,
+        day_end_utc: str,
+    ) -> int:
+        row = con.execute(
+            """
+            SELECT COALESCE(SUM(page_count), 0) AS pages
+            FROM documents
+            WHERE deleted = 0
+              AND ext = '.pdf'
+              AND indexed_at IS NOT NULL
+              AND indexed_at >= ?
+              AND indexed_at < ?
+            """,
+            (day_start_utc, day_end_utc),
+        ).fetchone()
+        return int(row["pages"] or 0) if row else 0
+
     def _delete_chunks(self, con: sqlite3.Connection, document_id: str) -> None:
         rows = list(con.execute("SELECT id FROM chunks WHERE document_id = ?", (document_id,)))
         for row in rows:
@@ -719,7 +894,12 @@ class Database:
             )
 
     def search(
-        self, query: str, limit: int = 50, offset: int = 0, scope: str | None = None
+        self,
+        query: str,
+        limit: int = 50,
+        offset: int = 0,
+        scope: str | None = None,
+        document_id: str | None = None,
     ) -> list[dict[str, Any]]:
         variants = search_variants(query)
         if not variants:
@@ -727,12 +907,7 @@ class Database:
         tokenizer = self.fts_tokenizer()
         min_match_chars = 3 if tokenizer == "trigram" else 2
         use_like = len(variants[0]) < min_match_chars
-        scope = normalize_scope(scope)
-        scope_clause = ""
-        scope_params: list[Any] = []
-        if scope:
-            scope_clause = " AND d.rel_path LIKE ?"
-            scope_params.append(f"{scope}/%")
+        filter_sql, filter_params = search_document_filters(scope, document_id)
         like_clause = " OR ".join("c.text LIKE ?" for _ in variants)
         like_params = [f"%{variant}%" for variant in variants]
         with self.connect() as con:
@@ -746,11 +921,11 @@ class Database:
                                d.citation, d.publication_status, d.publication_info
                         FROM chunks c
                         JOIN documents d ON d.id = c.document_id
-                        WHERE d.deleted = 0 AND ({like_clause}){scope_clause}
+                        WHERE {filter_sql} AND ({like_clause})
                         ORDER BY d.updated_at DESC, c.page, c.ordinal
                         LIMIT ? OFFSET ?
                         """,
-                        (*like_params, *scope_params, limit, offset),
+                        (*filter_params, *like_params, limit, offset),
                     )
                 )
                 return self._rows_with_search_snippets(rows, variants)
@@ -766,11 +941,11 @@ class Database:
                         FROM chunks_fts
                         JOIN chunks c ON c.id = chunks_fts.chunk_id
                         JOIN documents d ON d.id = c.document_id
-                        WHERE chunks_fts MATCH ? AND d.deleted = 0{scope_clause}
+                        WHERE chunks_fts MATCH ? AND {filter_sql}
                         ORDER BY bm25(chunks_fts), c.page, c.ordinal
                         LIMIT ? OFFSET ?
                         """,
-                        (expr, *scope_params, limit, offset),
+                        (expr, *filter_params, limit, offset),
                     )
                 )
                 return self._rows_with_search_snippets(rows, variants)
@@ -784,14 +959,171 @@ class Database:
                                d.citation, d.publication_status, d.publication_info
                         FROM chunks c
                         JOIN documents d ON d.id = c.document_id
-                        WHERE d.deleted = 0 AND ({like_clause}){scope_clause}
+                        WHERE {filter_sql} AND ({like_clause})
                         ORDER BY d.updated_at DESC, c.page, c.ordinal
                         LIMIT ? OFFSET ?
                         """,
-                        (*like_params, *scope_params, limit, offset),
+                        (*filter_params, *like_params, limit, offset),
                     )
                 )
                 return self._rows_with_search_snippets(rows, variants)
+
+    def search_page(
+        self, query: str, limit: int = 50, offset: int = 0, scope: str | None = None
+    ) -> dict[str, Any]:
+        page_size = max(1, int(limit))
+        start = max(0, int(offset))
+        rows = self.search(query, limit=page_size + 1, offset=start, scope=scope)
+        has_more = len(rows) > page_size
+        results = rows[:page_size]
+        return {
+            "results": results,
+            "count": len(results),
+            "returned_count": len(results),
+            "offset": start,
+            "limit": page_size,
+            "has_more": has_more,
+            "next_offset": start + len(results) if has_more else None,
+        }
+
+    def search_document_page(
+        self,
+        query: str,
+        document_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        page_size = max(1, int(limit))
+        start = max(0, int(offset))
+        rows = self.search(query, limit=page_size + 1, offset=start, document_id=document_id)
+        has_more = len(rows) > page_size
+        results = rows[:page_size]
+        return {
+            "results": results,
+            "count": len(results),
+            "returned_count": len(results),
+            "offset": start,
+            "limit": page_size,
+            "has_more": has_more,
+            "next_offset": start + len(results) if has_more else None,
+        }
+
+    def search_groups_page(
+        self, query: str, limit: int = 50, offset: int = 0, scope: str | None = None
+    ) -> dict[str, Any]:
+        page_size = max(1, int(limit))
+        start = max(0, int(offset))
+        groups = self.search_groups(query, limit=page_size + 1, offset=start, scope=scope)
+        has_more = len(groups) > page_size
+        results = groups[:page_size]
+        return {
+            "groups": results,
+            "count": len(results),
+            "returned_count": len(results),
+            "offset": start,
+            "limit": page_size,
+            "has_more": has_more,
+            "next_offset": start + len(results) if has_more else None,
+        }
+
+    def search_groups(
+        self, query: str, limit: int = 50, offset: int = 0, scope: str | None = None
+    ) -> list[dict[str, Any]]:
+        variants = search_variants(query)
+        if not variants:
+            return []
+        tokenizer = self.fts_tokenizer()
+        min_match_chars = 3 if tokenizer == "trigram" else 2
+        use_like = len(variants[0]) < min_match_chars
+        filter_sql, filter_params = search_document_filters(scope, None)
+        if use_like:
+            return self._search_groups_like(variants, filter_sql, filter_params, limit, offset)
+        expr = fts_query_expr(query)
+        with self.connect() as con:
+            try:
+                rows = list(
+                    con.execute(
+                        f"""
+                        WITH matches AS (
+                            SELECT c.id AS match_id, c.document_id, c.page, c.ordinal, c.line,
+                                   c.text AS snippet, c.source, bm25(chunks_fts) AS rank,
+                                   d.rel_path, d.title, d.ext, d.status, d.searchable_pdf,
+                                   d.citation, d.publication_status, d.publication_info,
+                                   d.updated_at
+                            FROM chunks_fts
+                            JOIN chunks c ON c.id = chunks_fts.chunk_id
+                            JOIN documents d ON d.id = c.document_id
+                            WHERE chunks_fts MATCH ? AND {filter_sql}
+                        ),
+                        ranked AS (
+                            SELECT *,
+                                   COUNT(*) OVER (PARTITION BY document_id) AS match_count,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY document_id
+                                       ORDER BY rank, COALESCE(page, 0), ordinal, match_id
+                                   ) AS group_row
+                            FROM matches
+                        )
+                        SELECT match_id, document_id, page, ordinal, line, snippet, source,
+                               rel_path, title, ext, status, searchable_pdf, citation,
+                               publication_status, publication_info, match_count
+                        FROM ranked
+                        WHERE group_row = 1
+                        ORDER BY match_count DESC, rank, updated_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (expr, *filter_params, limit, offset),
+                    )
+                )
+                return self._rows_with_search_snippets(rows, variants)
+            except sqlite3.OperationalError:
+                return self._search_groups_like(variants, filter_sql, filter_params, limit, offset)
+
+    def _search_groups_like(
+        self,
+        variants: list[str],
+        filter_sql: str,
+        filter_params: list[Any],
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        like_clause = " OR ".join("c.text LIKE ?" for _ in variants)
+        like_params = [f"%{variant}%" for variant in variants]
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    f"""
+                    WITH matches AS (
+                        SELECT c.id AS match_id, c.document_id, c.page, c.ordinal, c.line,
+                               c.text AS snippet, c.source,
+                               d.rel_path, d.title, d.ext, d.status, d.searchable_pdf,
+                               d.citation, d.publication_status, d.publication_info,
+                               d.updated_at
+                        FROM chunks c
+                        JOIN documents d ON d.id = c.document_id
+                        WHERE {filter_sql} AND ({like_clause})
+                    ),
+                    ranked AS (
+                        SELECT *,
+                               COUNT(*) OVER (PARTITION BY document_id) AS match_count,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY document_id
+                                   ORDER BY COALESCE(page, 0), ordinal, match_id
+                               ) AS group_row
+                        FROM matches
+                    )
+                    SELECT match_id, document_id, page, ordinal, line, snippet, source,
+                           rel_path, title, ext, status, searchable_pdf, citation,
+                           publication_status, publication_info, match_count
+                    FROM ranked
+                    WHERE group_row = 1
+                    ORDER BY match_count DESC, updated_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*filter_params, *like_params, limit, offset),
+                )
+            )
+            return self._rows_with_search_snippets(rows, variants)
 
     def _rows_with_search_snippets(
         self, rows: Iterable[sqlite3.Row], variants: list[str]
@@ -853,6 +1185,31 @@ class Database:
                 "chunks": [dict(row) for row in rows],
             }
 
+    def get_chunk(self, document_id: str, match_id: int) -> dict[str, Any] | None:
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT * FROM chunks
+                WHERE id = ? AND document_id = ?
+                """,
+                (match_id, document_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def chunks_for_page(self, document_id: str, page: int) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT * FROM chunks
+                    WHERE document_id = ? AND page = ?
+                    ORDER BY ordinal
+                    """,
+                    (document_id, page),
+                )
+            )
+            return [dict(row) for row in rows]
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as con:
             row = con.execute(
@@ -869,16 +1226,20 @@ class Database:
             jobs = con.execute(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE status = 'queued') AS queued,
-                    COUNT(*) FILTER (WHERE status = 'processing') AS processing
+                    COUNT(*) FILTER (WHERE jobs.status = 'queued') AS queued,
+                    COUNT(*) FILTER (WHERE jobs.status = 'processing') AS processing
                 FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE documents.deleted = 0
                 """
             ).fetchone()
             latest = con.execute(
                 """
-                SELECT * FROM jobs
-                WHERE status IN ('queued', 'processing')
-                ORDER BY status = 'processing' DESC, updated_at DESC
+                SELECT jobs.* FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE jobs.status IN ('queued', 'processing')
+                  AND documents.deleted = 0
+                ORDER BY jobs.status = 'processing' DESC, jobs.updated_at DESC
                 LIMIT 1
                 """
             ).fetchone()
@@ -897,6 +1258,7 @@ class Database:
                     SELECT jobs.*, documents.rel_path, documents.title
                     FROM jobs
                     JOIN documents ON documents.id = jobs.document_id
+                    WHERE documents.deleted = 0
                     ORDER BY jobs.updated_at DESC
                     LIMIT ?
                     """,
@@ -920,6 +1282,27 @@ def normalize_scope(value: str | None) -> str:
     normalized = str(value).replace("\\", "/").strip().strip("/")
     parts = [part for part in normalized.split("/") if part not in {"", ".", ".."}]
     return "/".join(parts)
+
+
+def search_document_filters(
+    scope: str | None = None, document_id: str | None = None
+) -> tuple[str, list[Any]]:
+    filters = ["d.deleted = 0"]
+    params: list[Any] = []
+    if document_id:
+        filters.append("d.id = ?")
+        params.append(document_id)
+    normalized_scope = normalize_scope(scope)
+    if normalized_scope:
+        filters.append("d.rel_path LIKE ?")
+        params.append(f"{normalized_scope}/%")
+    return " AND ".join(filters), params
+
+
+def normalize_journal_mode(value: str | None) -> str:
+    normalized = str(value or "DELETE").strip().upper()
+    allowed = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+    return normalized if normalized in allowed else "DELETE"
 
 
 def search_result_snippet(

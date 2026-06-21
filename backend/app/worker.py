@@ -12,7 +12,7 @@ from .scanner import run_worker_loop
 
 def main() -> None:
     settings = get_settings()
-    db = Database(settings.db_path)
+    db = Database(settings.db_path, settings.sqlite_journal_mode)
     resources = ResourcePolicy(settings)
     indexer = DocumentIndexer(settings, db, resources)
     stop_event = threading.Event()

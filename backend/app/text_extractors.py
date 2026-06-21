@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -171,3 +172,59 @@ def convert_office_to_pdf(path: Path, output_dir: Path) -> Path | None:
         return None
     candidate = output_dir / f"{path.stem}.pdf"
     return candidate if candidate.exists() else None
+
+
+class CajConversionError(RuntimeError):
+    pass
+
+
+def convert_caj_to_pdf(
+    path: Path,
+    output_dir: Path,
+    command_template: str,
+    timeout_seconds: int = 600,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_pdf = output_dir / f"{path.stem}.pdf"
+    output_pdf.unlink(missing_ok=True)
+
+    command = caj_command_args(command_template, path, output_pdf)
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise CajConversionError(
+            f"CAJ converter command not found: {command[0]!r}. "
+            "Install a CAJ-to-PDF converter or set CAJ_CONVERTER_COMMAND."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CajConversionError(f"CAJ conversion timed out after {timeout_seconds}s") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise CajConversionError(f"CAJ conversion failed: {detail or exc}") from exc
+
+    if not output_pdf.exists():
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise CajConversionError(
+            f"CAJ converter did not create expected PDF: {output_pdf}. {detail}"
+        )
+    return output_pdf
+
+
+def caj_command_args(command_template: str, input_path: Path, output_path: Path) -> list[str]:
+    template = str(command_template or "").strip()
+    if not template:
+        raise CajConversionError("CAJ_CONVERTER_COMMAND is not configured")
+    quoted_input = shlex.quote(str(input_path))
+    quoted_output = shlex.quote(str(output_path))
+    if "{input}" in template or "{output}" in template:
+        rendered = template.format(input=quoted_input, output=quoted_output)
+    else:
+        rendered = f"{template} {quoted_input} {quoted_output}"
+    return shlex.split(rendered)

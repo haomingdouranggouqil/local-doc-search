@@ -12,13 +12,17 @@ class Settings(BaseSettings):
 
     document_root: Path = Field(default=Path("/library"))
     state_dir: Path = Field(default=Path("/data"))
+    sqlite_journal_mode: str = "DELETE"
 
     exclude_dirs: str = (
         ".docsearch,.git,.svn,backend,frontend,scripts,node_modules,"
         "__pycache__,.pytest_cache,.venv,venv"
     )
     exclude_paths: str = "README.md,.env,.env.example,docker-compose.yml,docs/design"
-    supported_extensions: str = ".pdf,.txt,.md,.doc,.docx"
+    supported_extensions: str = ".pdf,.txt,.md,.doc,.docx,.caj"
+    pdf_text_only_paths: str = "pdf/论文"
+    caj_converter_command: str = "caj2pdf convert {input} -o {output}"
+    caj_converter_timeout_seconds: int = 600
     max_file_mb: int = 0
     max_output_pdf_mb: int = 0
     resource_auto_tune: bool = True
@@ -32,6 +36,10 @@ class Settings(BaseSettings):
     paddleocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     paddleocr_api_token: str = ""
     paddleocr_api_model: str = "PP-OCRv6"
+    paddleocr_daily_page_limit: int = 20000
+    paddleocr_quota_timezone: str = "Asia/Shanghai"
+    paddleocr_api_batch_pages: int = 100
+    paddleocr_api_transport_retries: int = 4
     paddleocr_api_poll_seconds: float = 5.0
     paddleocr_api_timeout_seconds: int = 7200
     paddleocr_api_request_timeout_seconds: int = 300
@@ -93,6 +101,14 @@ class Settings(BaseSettings):
         return {
             item.strip().lower()
             for item in self.supported_extensions.split(",")
+            if item.strip()
+        }
+
+    @property
+    def pdf_text_only_rel_paths(self) -> set[str]:
+        return {
+            item.strip().replace("\\", "/").strip("/")
+            for item in self.pdf_text_only_paths.split(",")
             if item.strip()
         }
 

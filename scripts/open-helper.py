@@ -56,35 +56,8 @@ def open_file_windows(path: Path) -> dict[str, object]:
     if path.suffix.lower() in {".txt", ".md"}:
         return popen_visible(["notepad.exe", str(path)], "notepad")
 
-    script = (
-        "$target = $args[0]; "
-        "$process = Start-Process -FilePath $target -WindowStyle Normal -PassThru; "
-        "if ($process) { $process.Id }"
-    )
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or "Start-Process failed"
-        raise RuntimeError(message)
-
-    pid_text = completed.stdout.strip().splitlines()
-    return {
-        "method": "powershell-start-process",
-        "pid": int(pid_text[-1]) if pid_text and pid_text[-1].isdigit() else None,
-    }
+    os.startfile(str(path))
+    return {"method": "windows-startfile", "pid": None}
 
 
 def popen_visible(command: list[str], method: str) -> dict[str, object]:

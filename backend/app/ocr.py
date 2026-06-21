@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -55,7 +57,60 @@ class PaddleOcrEngine:
         source_pdf: Path,
         progress_callback: ProgressCallback | None = None,
     ) -> list[OcrPageResult]:
+        batch_pages = int(getattr(self.settings, "paddleocr_api_batch_pages", 0) or 0)
+        if batch_pages > 0:
+            try:
+                with fitz.open(source_pdf) as doc:
+                    page_count = doc.page_count
+            except Exception:
+                page_count = 0
+            if page_count > batch_pages:
+                return self._recognize_pdf_in_batches(source_pdf, page_count, batch_pages, progress_callback)
         return self._client.ocr_pdf(source_pdf, progress_callback)
+
+    def _recognize_pdf_in_batches(
+        self,
+        source_pdf: Path,
+        page_count: int,
+        batch_pages: int,
+        progress_callback: ProgressCallback | None,
+    ) -> list[OcrPageResult]:
+        temp_dir = Path(getattr(self.settings, "temp_dir", source_pdf.parent))
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        pages: list[OcrPageResult] = []
+        with fitz.open(source_pdf) as doc:
+            for start in range(0, page_count, batch_pages):
+                end = min(page_count, start + batch_pages)
+                chunk_pdf = temp_dir / (
+                    f"{source_pdf.stem}.{uuid.uuid4().hex}.pages-{start + 1}-{end}.pdf"
+                )
+                with fitz.open() as chunk:
+                    chunk.insert_pdf(doc, from_page=start, to_page=end - 1)
+                    chunk.save(chunk_pdf, garbage=4, deflate=True)
+                try:
+                    if progress_callback:
+                        progress_callback(
+                            start,
+                            page_count,
+                            f"Uploading PDF pages {start + 1}-{end} to PaddleOCR API",
+                        )
+
+                    def chunk_progress(done: float, _total: int, message: str) -> None:
+                        if not progress_callback:
+                            return
+                        bounded_done = max(0.0, min(float(done or 0), float(end - start)))
+                        progress_callback(
+                            start + bounded_done,
+                            page_count,
+                            f"{message} pages {start + 1}-{end}",
+                        )
+
+                    for page in self._client.ocr_pdf(chunk_pdf, chunk_progress):
+                        page.page_number = start + max(1, int(page.page_number or 1))
+                        pages.append(page)
+                finally:
+                    chunk_pdf.unlink(missing_ok=True)
+        return sorted(pages, key=lambda page: page.page_number)
 
 
 class PaddleOcrApiClient:
@@ -79,14 +134,20 @@ class PaddleOcrApiClient:
             ),
             follow_redirects=True,
         ) as client:
-            job_id = self._submit_file(client, source_pdf)
+            job_id = self._with_transport_retries(
+                "submit OCR job",
+                lambda: self._submit_file(client, source_pdf),
+            )
             jsonl_url = self._poll_job(client, job_id, progress_callback)
             jsonl_text = self._download_jsonl(client, jsonl_url)
         return parse_api_jsonl(jsonl_text)
 
     @property
     def headers(self) -> dict[str, str]:
-        return {"Authorization": f"bearer {self.settings.paddleocr_api_token}"}
+        return {
+            "Authorization": f"bearer {self.settings.paddleocr_api_token}",
+            "User-Agent": "local-doc-search/1.0",
+        }
 
     def _submit_file(self, client: httpx.Client, source_pdf: Path) -> str:
         optional_payload = {
@@ -124,7 +185,10 @@ class PaddleOcrApiClient:
             if time.monotonic() > deadline:
                 raise PaddleOcrApiError(f"OCR API job timed out: {job_id}")
 
-            response = client.get(f"{self.settings.paddleocr_api_url}/{job_id}", headers=self.headers)
+            response = self._with_transport_retries(
+                "poll OCR job",
+                lambda: client.get(f"{self.settings.paddleocr_api_url}/{job_id}", headers=self.headers),
+            )
             payload = self._json_response(response, "poll OCR job")
             data = payload.get("data") or {}
             state = str(data.get("state") or "").lower()
@@ -157,12 +221,30 @@ class PaddleOcrApiClient:
             raise PaddleOcrApiError(f"Unexpected OCR API state {state!r}: {payload}")
 
     def _download_jsonl(self, client: httpx.Client, jsonl_url: str) -> str:
-        response = client.get(jsonl_url)
+        response = self._with_transport_retries(
+            "download OCR JSONL",
+            lambda: client.get(jsonl_url, headers={"User-Agent": "local-doc-search/1.0"}),
+        )
         if response.status_code != 200:
             raise PaddleOcrApiError(
                 f"download OCR JSONL failed: HTTP {response.status_code}; {response.text[:500]}"
             )
         return response.text
+
+    def _with_transport_retries(self, action: str, call: Callable[[], Any]) -> Any:
+        attempts = max(1, int(getattr(self.settings, "paddleocr_api_transport_retries", 4) or 1))
+        delay = max(1.0, float(getattr(self.settings, "paddleocr_api_poll_seconds", 5.0) or 5.0))
+        last_error: httpx.TransportError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return call()
+            except httpx.TransportError as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                time.sleep(min(30.0, delay * attempt))
+        assert last_error is not None
+        raise last_error
 
     def _json_response(self, response: httpx.Response, action: str) -> dict[str, Any]:
         if response.status_code != 200:
@@ -190,58 +272,64 @@ def make_searchable_pdf(
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     output_pdf.unlink(missing_ok=True)
 
-    if progress_callback:
-        progress_callback(0, 0, "Uploading PDF to PaddleOCR API")
-    api_pages = engine.recognize_pdf(source_pdf, progress_callback)
-    pages_by_number = {page.page_number: page for page in api_pages}
+    ocr_input_pdf, cleanup_pdf = prepare_ocr_input_pdf(source_pdf, settings, output_pdf)
+    try:
+        if progress_callback:
+            progress_callback(0, 0, "Uploading PDF to PaddleOCR API")
+        api_pages = engine.recognize_pdf(ocr_input_pdf, progress_callback)
+        pages_by_number = {page.page_number: page for page in api_pages}
 
-    chunks: list[dict] = []
-    text_chars = 0
-    with fitz.open(source_pdf) as doc:
-        page_total = doc.page_count
-        page_limit = settings.ocr_max_pages if max_pages is None else max_pages
-        target_page_count = page_limit if page_limit and page_limit > 0 else page_total
-        target_page_count = min(page_total, target_page_count)
+        chunks: list[dict] = []
+        text_chars = 0
+        with fitz.open(source_pdf) as doc:
+            page_total = doc.page_count
+            page_limit = settings.ocr_max_pages if max_pages is None else max_pages
+            target_page_count = page_limit if page_limit and page_limit > 0 else page_total
+            target_page_count = min(page_total, target_page_count)
 
-        for page_number in range(1, target_page_count + 1):
-            page = doc.load_page(page_number - 1)
-            page_result = pages_by_number.get(page_number)
-            if not page_result:
+            for page_number in range(1, target_page_count + 1):
+                page = doc.load_page(page_number - 1)
+                page_result = pages_by_number.get(page_number)
+                if not page_result:
+                    if progress_callback:
+                        progress_callback(page_number, page_total, "Embedding OCR text")
+                    continue
+
+                strip_invisible_text_content(doc, page)
+                image_width, image_height = page_image_size(page_result, page.rect)
+                line_no = 0
+                for line in page_result.lines:
+                    clean = " ".join(line.text.split())
+                    if not clean:
+                        continue
+                    rect = image_box_to_pdf_rect(
+                        line.box,
+                        line.image_width or image_width,
+                        line.image_height or image_height,
+                        page.rect,
+                    )
+                    insert_hidden_text(page, rect, clean, settings.pdf_text_font)
+                    line_no += 1
+                    chunks.append(
+                        {
+                            "page": page_number,
+                            "ordinal": len(chunks),
+                            "line": line_no,
+                            "text": clean,
+                            "bbox": line.box,
+                            "source": "paddleocr-api",
+                        }
+                    )
+                    text_chars += len(clean)
                 if progress_callback:
                     progress_callback(page_number, page_total, "Embedding OCR text")
-                continue
 
-            image_width, image_height = page_image_size(page_result, page.rect)
-            line_no = 0
-            for line in page_result.lines:
-                clean = " ".join(line.text.split())
-                if not clean:
-                    continue
-                rect = image_box_to_pdf_rect(
-                    line.box,
-                    line.image_width or image_width,
-                    line.image_height or image_height,
-                    page.rect,
-                )
-                insert_hidden_text(page, rect, clean, settings.pdf_text_font)
-                line_no += 1
-                chunks.append(
-                    {
-                        "page": page_number,
-                        "ordinal": len(chunks),
-                        "line": line_no,
-                        "text": clean,
-                        "bbox": line.box,
-                        "source": "paddleocr-api",
-                    }
-                )
-                text_chars += len(clean)
             if progress_callback:
-                progress_callback(page_number, page_total, "Embedding OCR text")
-
-        if progress_callback:
-            progress_callback(target_page_count, page_total, "Saving searchable PDF")
-        doc.save(output_pdf, garbage=4, deflate=True)
+                progress_callback(target_page_count, page_total, "Saving searchable PDF")
+            doc.save(output_pdf, garbage=4, deflate=True)
+    finally:
+        if cleanup_pdf:
+            cleanup_pdf.unlink(missing_ok=True)
 
     if resources:
         resources.check_output_pdf_size(output_pdf.stat().st_size)
@@ -252,6 +340,26 @@ def make_searchable_pdf(
         page_count=target_page_count,
         text_chars=text_chars,
     )
+
+
+def prepare_ocr_input_pdf(
+    source_pdf: Path,
+    settings: Settings,
+    output_pdf: Path,
+) -> tuple[Path, Path | None]:
+    temp_dir = Path(getattr(settings, "temp_dir", output_pdf.parent))
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_pdf = temp_dir / f"{source_pdf.stem}.{uuid.uuid4().hex}.ocr-input.pdf"
+
+    changed = False
+    with fitz.open(source_pdf) as doc:
+        for page in doc:
+            changed = strip_invisible_text_content(doc, page) or changed
+        if not changed:
+            return source_pdf, None
+        doc.save(temp_pdf, garbage=4, deflate=True)
+
+    return temp_pdf, temp_pdf
 
 
 def parse_api_jsonl(jsonl_text: str) -> list[OcrPageResult]:
@@ -274,8 +382,6 @@ def parse_api_jsonl(jsonl_text: str) -> list[OcrPageResult]:
                 continue
             image_width, image_height = extract_image_size(pruned, res, result, payload)
             lines = parse_ocr_result(pruned, image_width, image_height)
-            if not image_width or not image_height:
-                image_width, image_height = infer_image_size(lines)
             page_number = extract_page_number(pruned, res, result) or next_page_number
             pages.append(
                 OcrPageResult(
@@ -404,10 +510,56 @@ def page_image_size(page_result: OcrPageResult, page_rect: fitz.Rect) -> tuple[f
     width = page_result.image_width
     height = page_result.image_height
     if not width or not height:
-        width, height = infer_image_size(page_result.lines)
+        width, height = infer_page_image_size(page_result.lines, page_rect)
     if not width or not height:
         width, height = page_rect.width, page_rect.height
     return max(1.0, float(width)), max(1.0, float(height))
+
+
+def infer_page_image_size(
+    lines: list[OcrLine],
+    page_rect: fitz.Rect,
+) -> tuple[float | None, float | None]:
+    width, height = infer_image_size(lines)
+    if not width or not height:
+        return None, None
+
+    page_width = max(1.0, float(page_rect.width))
+    page_height = max(1.0, float(page_rect.height))
+    page_aspect = page_width / page_height
+    return max(width, height * page_aspect), max(height, width / page_aspect)
+
+
+def strip_invisible_text_content(doc: fitz.Document, page: fitz.Page) -> bool:
+    contents = page.get_contents()
+    if not contents:
+        return False
+
+    keep: list[int] = []
+    dropped = False
+    for xref in contents:
+        data = doc.xref_stream(xref)
+        if is_invisible_text_stream(data):
+            dropped = True
+            continue
+        keep.append(xref)
+
+    if not dropped:
+        return False
+
+    content_refs = " ".join(f"{xref} 0 R" for xref in keep)
+    doc.xref_set_key(page.xref, "Contents", f"[{content_refs}]")
+    return True
+
+
+def is_invisible_text_stream(data: bytes) -> bool:
+    normalized = b" " + b" ".join(data.split()) + b" "
+    return (
+        b" BT " in normalized
+        and b" ET " in normalized
+        and re.search(rb"\s3\s+Tr\s", normalized) is not None
+        and b" Do " not in normalized
+    )
 
 
 def normalize_box(value: Any) -> list[list[float]] | None:

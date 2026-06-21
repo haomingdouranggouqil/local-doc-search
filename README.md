@@ -1,6 +1,6 @@
 # 本地资料检索
 
-这是一个 Docker 化的本地资料 OCR 与全文检索项目。把 PDF、TXT、MD、DOC、DOCX 放进 `data/`，系统会自动扫描、索引，并在网页中提供全文搜索。
+这是一个 Docker 化的本地资料 OCR 与全文检索项目。把 PDF、CAJ、TXT、MD、DOC、DOCX 放进 `data/`，系统会自动扫描、索引，并在网页中提供全文搜索。
 
 网页入口：
 
@@ -10,9 +10,11 @@ http://localhost:8517
 
 ## 功能
 
-- 自动扫描 `data/` 及其子目录，支持 `.pdf`、`.txt`、`.md`、`.doc`、`.docx`。
+- 自动扫描 `data/` 及其子目录，支持 `.pdf`、`.caj`、`.txt`、`.md`、`.doc`、`.docx`。
 - PDF OCR 改为调用 PaddleOCR 官方 API，模型固定为 `PP-OCRv6`，不再本地加载 PaddleOCR，也不再占用本机 GPU/CPU 跑 OCR。
 - PDF 处理完成后会写回原路径：保留原 PDF 页面内容，只追加不可见文字层，不再把页面渲染成图片 PDF。
+- `data/pdf/论文/` 下的 PDF 默认只读取内嵌文字层，不再重新 OCR。
+- `.caj` 文件会先按 `CAJ_CONVERTER_COMMAND` 转为可搜索 PDF，再抽取文字建立索引。
 - TXT/MD/DOC/DOCX 会建立本地 SQLite/FTS 索引。
 - 检索索引会额外写入简体/繁体变体；原文档不被修改，用户可用简体或繁体搜索。
 - 前端可限制搜索范围，例如只搜 `pdf/论文`。
@@ -45,12 +47,17 @@ OCR_ENGINE=api
 OCR_DEVICE=api
 PADDLEOCR_API_TOKEN=
 PADDLEOCR_API_MODEL=PP-OCRv6
+PADDLEOCR_DAILY_PAGE_LIMIT=20000
+PADDLEOCR_QUOTA_TIMEZONE=Asia/Shanghai
 PADDLEOCR_API_POLL_SECONDS=5
 PADDLEOCR_API_TIMEOUT_SECONDS=7200
 PADDLEOCR_API_REQUEST_TIMEOUT_SECONDS=300
 PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY=false
 PADDLEOCR_USE_DOC_UNWARPING=false
 PADDLEOCR_USE_TEXTLINE_ORIENTATION=false
+PDF_TEXT_ONLY_PATHS=pdf/论文
+CAJ_CONVERTER_COMMAND=caj2pdf convert {input} -o {output}
+CAJ_CONVERTER_TIMEOUT_SECONDS=600
 
 DEEPSEEK_API_KEY=
 DEEPSEEK_MODEL=deepseek-v4-pro
@@ -61,8 +68,14 @@ LOCAL_OPEN_ENABLED=true
 说明：
 
 - `PADDLEOCR_API_TOKEN`：PaddleOCR API access token。
+- `PADDLEOCR_DAILY_PAGE_LIMIT`：PaddleOCR API 每日页数额度；前端会显示当天已用页数/额度。
+- `PADDLEOCR_QUOTA_TIMEZONE`：每日额度统计使用的时区，默认按北京时间自然日统计。
 - `PADDLEOCR_API_TIMEOUT_SECONDS`：单个 OCR 任务最长等待时间。
 - `PADDLEOCR_API_POLL_SECONDS`：轮询 OCR 任务进度的间隔。
+- `PDF_TEXT_ONLY_PATHS`：逗号分隔的相对路径列表，匹配目录下的 PDF 只读取已有文字层，不调用 OCR。默认 `pdf/论文`。
+- `CAJ_CONVERTER_COMMAND`：CAJ 转 PDF 命令模板，必须包含或能追加输入/输出路径；默认按 `caj2pdf convert {input} -o {output}` 调用。
+- `CAJ_CONVERTER_TIMEOUT_SECONDS`：单个 CAJ 转换任务的超时时间。
+- 后端 Docker 镜像默认安装 `caj2pdf`、`mutool` 及其 Python 依赖；如需改用其他转换器，覆盖 `CAJ_CONVERTER_COMMAND` 即可。
 - `DEEPSEEK_API_KEY`：未配置时仍可 OCR 和搜索，只是不生成出版引用。
 - `LOCAL_OPEN_ENABLED`：控制后端本地运行时是否允许打开文件；Docker 运行时由 `scripts/open-helper.py` 处理。
 

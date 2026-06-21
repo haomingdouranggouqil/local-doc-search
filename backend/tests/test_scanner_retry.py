@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.config import Settings
+from app.database import Database
+from app.resources import ResourcePolicy
+from app.scanner import DocumentScanner
+
+
+class ScannerRetryTests(unittest.TestCase):
+    def test_scan_can_requeue_failed_unchanged_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "library"
+            library.mkdir()
+            source = library / "sample.txt"
+            source.write_text("sample", encoding="utf-8")
+            settings = Settings(
+                document_root=library,
+                state_dir=root / ".state",
+                supported_extensions=".txt",
+                resource_auto_tune=False,
+            )
+            settings.ensure_dirs()
+            db = Database(settings.db_path, settings.sqlite_journal_mode)
+            scanner = DocumentScanner(settings, db, ResourcePolicy(settings))
+
+            first = scanner.scan_once()
+            self.assertEqual(1, first["changed"])
+            job = db.claim_next_job()
+            self.assertIsNotNone(job)
+            db.fail_document(job["document_id"], "temporary failure")
+            db.update_job(job["id"], status="failed", progress=1, message="Failed", error="temporary failure")
+
+            normal_rescan = scanner.scan_once()
+            self.assertEqual(0, normal_rescan["requeued"])
+            self.assertEqual(0, db.stats()["jobs"]["queued"])
+
+            retry_rescan = scanner.scan_once(retry_failed=True)
+
+            self.assertEqual(1, retry_rescan["requeued"])
+            stats = db.stats()
+            self.assertEqual(1, stats["jobs"]["queued"])
+            doc = db.get_document(job["document_id"])
+            self.assertEqual("queued", doc["status"])
+            self.assertIsNone(doc["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

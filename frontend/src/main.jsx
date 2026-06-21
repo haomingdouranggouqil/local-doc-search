@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlertTriangle,
@@ -6,7 +6,6 @@ import {
   Clock3,
   Cpu,
   Database,
-  Download,
   ExternalLink,
   FileSearch,
   FileText,
@@ -20,10 +19,14 @@ import './styles.css';
 
 const API = '/api';
 const LOCAL_OPEN_HELPER = 'http://127.0.0.1:8765/open';
+const SEARCH_GROUP_PAGE_SIZE = 200;
+const DOCUMENT_HIT_PAGE_SIZE = 100;
 
 function App() {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
+  const [resultGroups, setResultGroups] = useState([]);
+  const [expandedDocuments, setExpandedDocuments] = useState({});
+  const [documentHits, setDocumentHits] = useState({});
   const [selected, setSelected] = useState(null);
   const [stats, setStats] = useState(null);
   const [jobs, setJobs] = useState([]);
@@ -33,8 +36,12 @@ function App() {
   const [citationFor, setCitationFor] = useState(null);
   const [textContext, setTextContext] = useState(null);
   const [searching, setSearching] = useState(false);
+  const [hasMoreResults, setHasMoreResults] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
+  const [retryFailedOnScan, setRetryFailedOnScan] = useState(false);
   const [openStatus, setOpenStatus] = useState(null);
+  const searchRequestRef = useRef(0);
 
   useEffect(() => {
     refreshStatus();
@@ -44,21 +51,31 @@ function App() {
 
   useEffect(() => {
     if (!query.trim()) {
-      setResults([]);
+      searchRequestRef.current += 1;
+      setResultGroups([]);
+      setExpandedDocuments({});
+      setDocumentHits({});
       setSelected(null);
+      setHasMoreResults(false);
+      setLoadingMore(false);
       return;
     }
     setSearching(true);
+    const requestId = searchRequestRef.current + 1;
+    searchRequestRef.current = requestId;
     const timer = window.setTimeout(async () => {
       try {
-        const data = await getJson(
-          `${API}/search?q=${encodeURIComponent(query)}&scope=${encodeURIComponent(scope)}&limit=80`,
-        );
-        setResults(data.results || []);
-        setSelected(data.results?.[0] || null);
+        const data = await fetchSearchGroups(query, scope, 0);
+        if (requestId !== searchRequestRef.current) return;
+        const nextGroups = data.groups || [];
+        setResultGroups(nextGroups);
+        setExpandedDocuments({});
+        setDocumentHits({});
+        setSelected(null);
+        setHasMoreResults(Boolean(data.has_more));
         setCitationFor(null);
       } finally {
-        setSearching(false);
+        if (requestId === searchRequestRef.current) setSearching(false);
       }
     }, 240);
     return () => window.clearTimeout(timer);
@@ -94,10 +111,91 @@ function App() {
   async function triggerScan() {
     setScanLoading(true);
     try {
-      await postJson(`${API}/scan`);
+      await postJson(`${API}/scan?retry_failed=${retryFailedOnScan ? 'true' : 'false'}`);
       await refreshStatus();
     } finally {
       setScanLoading(false);
+    }
+  }
+
+  async function loadMoreGroups() {
+    if (loadingMore || searching || !hasMoreResults || !query.trim()) return;
+    setLoadingMore(true);
+    const requestId = searchRequestRef.current;
+    const offset = resultGroups.length;
+    try {
+      const data = await fetchSearchGroups(query, scope, offset);
+      if (requestId !== searchRequestRef.current) return;
+      const nextGroups = data.groups || [];
+      setResultGroups((current) => {
+        const seen = new Set(current.map((item) => item.document_id));
+        return [...current, ...nextGroups.filter((item) => !seen.has(item.document_id))];
+      });
+      setHasMoreResults(Boolean(data.has_more));
+    } finally {
+      if (requestId === searchRequestRef.current) setLoadingMore(false);
+    }
+  }
+
+  async function toggleDocumentGroup(group) {
+    const documentId = group.document_id;
+    const wasExpanded = Boolean(expandedDocuments[documentId]);
+    setExpandedDocuments((current) => ({
+      ...current,
+      [documentId]: !current[documentId],
+    }));
+    if (!wasExpanded && !documentHits[documentId]?.results?.length && !documentHits[documentId]?.loading) {
+      await loadDocumentHits(group, 0);
+    }
+  }
+
+  async function loadDocumentHits(group, offset = 0) {
+    const documentId = group.document_id;
+    const requestId = searchRequestRef.current;
+    setDocumentHits((current) => ({
+      ...current,
+      [documentId]: {
+        results: current[documentId]?.results || [],
+        hasMore: Boolean(current[documentId]?.hasMore),
+        nextOffset: current[documentId]?.nextOffset || 0,
+        loading: true,
+        error: null,
+      },
+    }));
+    try {
+      const data = await fetchDocumentSearchResults(query, documentId, offset);
+      if (requestId !== searchRequestRef.current) return;
+      const nextResults = data.results || [];
+      setDocumentHits((current) => {
+        const previousResults = offset > 0 ? current[documentId]?.results || [] : [];
+        const seen = new Set(previousResults.map((item) => item.match_id));
+        const results = [
+          ...previousResults,
+          ...nextResults.filter((item) => !seen.has(item.match_id)),
+        ];
+        return {
+          ...current,
+          [documentId]: {
+            results,
+            hasMore: Boolean(data.has_more),
+            nextOffset: data.next_offset ?? results.length,
+            loading: false,
+            error: null,
+          },
+        };
+      });
+    } catch (error) {
+      if (requestId !== searchRequestRef.current) return;
+      setDocumentHits((current) => ({
+        ...current,
+        [documentId]: {
+          results: current[documentId]?.results || [],
+          hasMore: Boolean(current[documentId]?.hasMore),
+          nextOffset: current[documentId]?.nextOffset || 0,
+          loading: false,
+          error: error.message || '无法加载文件内结果',
+        },
+      }));
     }
   }
 
@@ -121,6 +219,13 @@ function App() {
     const page = selected.page ? `#page=${selected.page}&search=${encodeURIComponent(query)}` : '';
     return `${API}/files/${selected.document_id}/pdf${page}`;
   }, [selected, query]);
+  const selectedPdfPageImageUrl = useMemo(() => {
+    if (!selected || !(selected.ext === '.pdf' || selected.searchable_pdf) || !selected.page) return '';
+    const params = new URLSearchParams({ page: String(selected.page) });
+    if (selected.match_id) params.set('match_id', String(selected.match_id));
+    if (query.trim()) params.set('q', query.trim());
+    return `${API}/files/${selected.document_id}/page-image?${params.toString()}`;
+  }, [selected, query]);
 
   return (
     <main className="app-shell">
@@ -142,10 +247,21 @@ function App() {
           <Metric icon={<Gauge size={18} />} label="资源策略" value={resourceLimitLabel(stats)} tone="blue" />
         </section>
 
-        <button className="scan-button" type="button" onClick={triggerScan} disabled={scanLoading}>
-          {scanLoading ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
-          重新扫描
-        </button>
+        <div className="scan-controls">
+          <button className="scan-button" type="button" onClick={triggerScan} disabled={scanLoading}>
+            {scanLoading ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
+            重新扫描
+          </button>
+          <label className="scan-retry-toggle" title="扫描时把处理失败或空结果的文件重新加入队列">
+            <input
+              type="checkbox"
+              checked={retryFailedOnScan}
+              onChange={(event) => setRetryFailedOnScan(event.target.checked)}
+              disabled={scanLoading}
+            />
+            <span>重试失败文件</span>
+          </label>
+        </div>
 
         <section className="queue">
           <div className="section-title">
@@ -218,57 +334,133 @@ function App() {
         </header>
 
         <div className="result-summary">
-          <b>{query.trim() ? `${results.length} 条结果` : '输入关键词开始检索'}</b>
+          <b>{searchSummaryLabel(query, resultGroups.length, hasMoreResults)}</b>
           <span>{scope ? `范围：${scope}` : stats?.fts_tokenizer === 'trigram' ? '中文连续匹配' : '全文索引'}</span>
         </div>
 
         <div className="results-list">
-          {results.map((result) => (
-            <article
-              role="listitem"
-              tabIndex={0}
-              className={`result-row ${selected?.match_id === result.match_id ? 'selected' : ''}`}
-              key={result.match_id}
-              onClick={() => setSelected(result)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') setSelected(result);
-              }}
-            >
-              <div className="file-icon">{result.ext === '.pdf' ? 'PDF' : result.ext.replace('.', '').toUpperCase()}</div>
-              <div className="result-body">
-                <div className="result-title">
-                  <span>{result.title}</span>
-                  <small>{result.page ? `PDF 第 ${result.page} 页` : result.line ? `第 ${result.line} 行` : '文本段落'}</small>
-                </div>
-                <p>{renderSnippet(result.snippet, query)}</p>
-                <div className="result-footer">
-                  <span className="result-path">{result.rel_path}</span>
-                  {result.citation && (
-                    <button
-                      type="button"
-                      className="citation-button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelected(result);
-                        setCitationFor(citationFor === result.match_id ? null : result.match_id);
-                        navigator.clipboard?.writeText(result.citation).catch(() => {});
-                      }}
-                    >
-                      导出引用
-                    </button>
-                  )}
-                </div>
-                {citationFor === result.match_id && result.citation && (
-                  <div className="citation-box">{result.citation}</div>
+          {resultGroups.map((group) => {
+            const documentId = group.document_id;
+            const expanded = Boolean(expandedDocuments[documentId]);
+            const hitState = documentHits[documentId] || {
+              results: [],
+              hasMore: false,
+              nextOffset: 0,
+              loading: false,
+              error: null,
+            };
+            return (
+              <React.Fragment key={documentId}>
+                <article
+                  role="button"
+                  tabIndex={0}
+                  className={`result-row file-group-row ${expanded ? 'expanded' : ''}`}
+                  onClick={() => toggleDocumentGroup(group)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      toggleDocumentGroup(group);
+                    }
+                  }}
+                >
+                  <div className="file-icon">{fileTypeLabel(group.ext)}</div>
+                  <div className="result-body">
+                    <div className="result-title">
+                      <span>{group.title}</span>
+                      <small>{formatNumber(group.match_count)} 处命中</small>
+                    </div>
+                    <p>{renderSnippet(group.snippet, query)}</p>
+                    <div className="result-footer">
+                      <span className="result-path">{group.rel_path}</span>
+                      <span className="group-toggle-label">{expanded ? '收起' : '展开'}</span>
+                    </div>
+                  </div>
+                </article>
+                {expanded && (
+                  <div className="group-hit-list">
+                    {hitState.error && <div className="group-hit-state error">{hitState.error}</div>}
+                    {hitState.loading && hitState.results.length === 0 && (
+                      <div className="group-hit-state">
+                        <Loader2 className="spin" size={15} />
+                        正在加载文件内结果
+                      </div>
+                    )}
+                    {hitState.results.map((result) => (
+                      <article
+                        role="listitem"
+                        tabIndex={0}
+                        className={`result-row hit-row ${selected?.match_id === result.match_id ? 'selected' : ''}`}
+                        key={result.match_id}
+                        onClick={() => setSelected(result)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            setSelected(result);
+                          }
+                        }}
+                      >
+                        <div className="hit-index">{result.page ? `P${result.page}` : result.line || result.ordinal + 1}</div>
+                        <div className="result-body">
+                          <div className="result-title">
+                            <span>{result.page ? `PDF 第 ${result.page} 页` : result.line ? `第 ${result.line} 行` : '文本段落'}</span>
+                            <small>{result.source}</small>
+                          </div>
+                          <p>{renderSnippet(result.snippet, query)}</p>
+                          {result.citation && (
+                            <div className="result-footer">
+                              <span className="result-path">{result.rel_path}</span>
+                              <button
+                                type="button"
+                                className="citation-button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setSelected(result);
+                                  setCitationFor(citationFor === result.match_id ? null : result.match_id);
+                                  navigator.clipboard?.writeText(result.citation).catch(() => {});
+                                }}
+                              >
+                                导出引用
+                              </button>
+                            </div>
+                          )}
+                          {citationFor === result.match_id && result.citation && (
+                            <div className="citation-box">{result.citation}</div>
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                    {hitState.hasMore && (
+                      <button
+                        type="button"
+                        className="load-more-button document-load-more-button"
+                        onClick={() => loadDocumentHits(group, hitState.nextOffset || hitState.results.length)}
+                        disabled={hitState.loading}
+                      >
+                        {hitState.loading ? <Loader2 className="spin" size={16} /> : null}
+                        加载此文件更多结果
+                      </button>
+                    )}
+                  </div>
                 )}
-              </div>
-            </article>
-          ))}
-          {query.trim() && !searching && results.length === 0 && (
+              </React.Fragment>
+            );
+          })}
+          {query.trim() && !searching && resultGroups.length === 0 && (
             <div className="empty-state">
               <FileSearch size={24} />
               <span>没有命中结果</span>
             </div>
+          )}
+          {query.trim() && hasMoreResults && (
+            <button
+              type="button"
+              className="load-more-button"
+              onClick={loadMoreGroups}
+              disabled={loadingMore || searching}
+            >
+              {loadingMore ? <Loader2 className="spin" size={16} /> : null}
+              加载更多文件
+            </button>
           )}
         </div>
       </section>
@@ -286,21 +478,18 @@ function App() {
                 <button type="button" onClick={openOriginalFile} title="打开本地文件">
                   <ExternalLink size={17} />
                 </button>
-                {(selected.ext === '.pdf' || selected.searchable_pdf) && (
-                  <a href={`${API}/files/${selected.document_id}/pdf`} target="_blank" rel="noreferrer" title="查看 OCR 版">
-                    <Download size={17} />
-                  </a>
-                )}
               </div>
             </div>
 
-            {selectedPdfUrl ? (
+            {selectedPdfPageImageUrl ? (
+              <PdfPagePreview src={selectedPdfPageImageUrl} page={selected.page} />
+            ) : selectedPdfUrl ? (
               <iframe className="pdf-frame" title="PDF 预览" src={selectedPdfUrl} />
             ) : (
               <TextPreview context={textContext} query={query} />
             )}
 
-            {selectedPdfUrl && <TextPreview context={textContext} query={query} compact />}
+            {(selectedPdfPageImageUrl || selectedPdfUrl) && <TextPreview context={textContext} query={query} compact />}
           </>
         ) : (
           <div className="preview-empty">
@@ -321,6 +510,29 @@ function Metric({ icon, label, value, tone = 'neutral' }) {
         <span>{label}</span>
         <b>{value}</b>
       </div>
+    </div>
+  );
+}
+
+function PdfPagePreview({ src, page }) {
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setLoaded(false);
+    setFailed(false);
+  }, [src]);
+
+  return (
+    <div className="pdf-page-frame">
+      {!loaded && !failed && <div className="pdf-page-state">正在加载第 {page} 页</div>}
+      {failed && <div className="pdf-page-state error">无法加载 PDF 页面预览</div>}
+      <img
+        src={src}
+        alt={`PDF 第 ${page} 页`}
+        onLoad={() => setLoaded(true)}
+        onError={() => setFailed(true)}
+      />
     </div>
   );
 }
@@ -388,6 +600,15 @@ function formatNumber(value) {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact' }).format(value || 0);
 }
 
+function searchSummaryLabel(query, count, hasMore) {
+  if (!query.trim()) return '输入关键词开始检索';
+  return hasMore ? `已显示 ${count}+ 个文件` : `${count} 个文件`;
+}
+
+function fileTypeLabel(ext) {
+  return ext === '.pdf' ? 'PDF' : String(ext || '').replace('.', '').toUpperCase();
+}
+
 function resourceLimitLabel(stats) {
   const limits = stats?.resources?.limits;
   if (!limits) return '自动';
@@ -406,13 +627,28 @@ function jobTooltip(job) {
 
 function ocrDeviceLabel(stats) {
   if (stats?.ocr?.engine === 'api' || stats?.ocr?.actual_device === 'api') {
-    return 'API';
+    const quota = ocrQuotaLabel(stats);
+    return quota ? `API ${quota}` : 'API';
   }
   const actual = stats?.ocr?.actual_device;
   if (actual?.startsWith('gpu')) return 'GPU';
   if (actual === 'cpu') return 'CPU';
   if (stats?.ocr?.cuda_available) return 'GPU 可用';
   return 'CPU';
+}
+
+function ocrQuotaLabel(stats) {
+  const quota = stats?.ocr?.quota;
+  const used = Number(quota?.used_pages);
+  const limit = Number(quota?.daily_limit_pages);
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) {
+    return '';
+  }
+  return `${formatQuotaNumber(used)}/${formatQuotaNumber(limit)}`;
+}
+
+function formatQuotaNumber(value) {
+  return String(Math.max(0, Math.trunc(Number(value) || 0)));
 }
 
 function isGpuReady(stats) {
@@ -426,6 +662,25 @@ async function getJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`GET ${url} failed`);
   return response.json();
+}
+
+async function fetchSearchGroups(query, scope, offset) {
+  const params = new URLSearchParams({
+    q: query,
+    scope,
+    limit: String(SEARCH_GROUP_PAGE_SIZE),
+    offset: String(offset),
+  });
+  return getJson(`${API}/search/groups?${params.toString()}`);
+}
+
+async function fetchDocumentSearchResults(query, documentId, offset) {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(DOCUMENT_HIT_PAGE_SIZE),
+    offset: String(offset),
+  });
+  return getJson(`${API}/search/document/${encodeURIComponent(documentId)}?${params.toString()}`);
 }
 
 async function postJson(url) {
@@ -462,7 +717,7 @@ async function openLocalDocument(result) {
 
 function openSuccessMessage(data) {
   if (data?.method === 'notepad') return '已调用 Notepad 打开';
-  if (data?.method === 'powershell-start-process') return '已请求系统打开';
+  if (data?.method === 'windows-startfile' || data?.method === 'powershell-start-process') return '已请求系统打开';
   return '已请求打开本地文件';
 }
 
