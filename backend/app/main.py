@@ -99,13 +99,15 @@ def scan(retry_failed: bool = Query(default=False)) -> dict[str, int]:
 def search(
     q: str = Query(default="", min_length=1),
     scope: str = Query(default=""),
+    mode: str = Query(default="basic"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    page = db.search_page(q, limit=limit, offset=offset, scope=scope)
+    page = db.search_page(q, limit=limit, offset=offset, scope=scope, mode=mode)
     return {
         "query": q,
         "scope": scope,
+        "mode": mode,
         **page,
         "results": [dict(row) for row in page["results"]],
     }
@@ -115,24 +117,28 @@ def search(
 def search_groups(
     q: str = Query(default="", min_length=1),
     scope: str = Query(default=""),
+    mode: str = Query(default="basic"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    page = db.search_groups_page(q, limit=limit, offset=offset, scope=scope)
-    return {"query": q, "scope": scope, **page}
+    page = db.search_groups_page(q, limit=limit, offset=offset, scope=scope, mode=mode)
+    return {"query": q, "scope": scope, "mode": mode, **page}
 
 
 @app.get("/api/search/document/{document_id}")
 def search_document(
     document_id: str,
     q: str = Query(default="", min_length=1),
+    mode: str = Query(default="basic"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     if db.get_document(document_id) is None:
         raise HTTPException(status_code=404, detail="document not found")
-    page = db.search_document_page(q, document_id=document_id, limit=limit, offset=offset)
-    return {"query": q, "document_id": document_id, **page}
+    page = db.search_document_page(
+        q, document_id=document_id, limit=limit, offset=offset, mode=mode
+    )
+    return {"query": q, "document_id": document_id, "mode": mode, **page}
 
 
 @app.get("/api/categories")

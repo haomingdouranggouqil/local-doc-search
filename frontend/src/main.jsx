@@ -21,9 +21,15 @@ const API = '/api';
 const LOCAL_OPEN_HELPER = 'http://127.0.0.1:8765/open';
 const SEARCH_GROUP_PAGE_SIZE = 200;
 const DOCUMENT_HIT_PAGE_SIZE = 100;
+const SEARCH_MODES = [
+  { value: 'basic', label: '普通' },
+  { value: 'line', label: '同一行' },
+  { value: 'document', label: '同一文件' },
+];
 
 function App() {
   const [query, setQuery] = useState('');
+  const [searchMode, setSearchMode] = useState('basic');
   const [resultGroups, setResultGroups] = useState([]);
   const [expandedDocuments, setExpandedDocuments] = useState({});
   const [documentHits, setDocumentHits] = useState({});
@@ -65,7 +71,7 @@ function App() {
     searchRequestRef.current = requestId;
     const timer = window.setTimeout(async () => {
       try {
-        const data = await fetchSearchGroups(query, scope, 0);
+        const data = await fetchSearchGroups(query, scope, searchMode, 0);
         if (requestId !== searchRequestRef.current) return;
         const nextGroups = data.groups || [];
         setResultGroups(nextGroups);
@@ -79,7 +85,7 @@ function App() {
       }
     }, 240);
     return () => window.clearTimeout(timer);
-  }, [query, scope]);
+  }, [query, scope, searchMode]);
 
   useEffect(() => {
     if (!selected) {
@@ -124,7 +130,7 @@ function App() {
     const requestId = searchRequestRef.current;
     const offset = resultGroups.length;
     try {
-      const data = await fetchSearchGroups(query, scope, offset);
+      const data = await fetchSearchGroups(query, scope, searchMode, offset);
       if (requestId !== searchRequestRef.current) return;
       const nextGroups = data.groups || [];
       setResultGroups((current) => {
@@ -163,7 +169,7 @@ function App() {
       },
     }));
     try {
-      const data = await fetchDocumentSearchResults(query, documentId, offset);
+      const data = await fetchDocumentSearchResults(query, documentId, searchMode, offset);
       if (requestId !== searchRequestRef.current) return;
       const nextResults = data.results || [];
       setDocumentHits((current) => {
@@ -226,6 +232,7 @@ function App() {
     if (query.trim()) params.set('q', query.trim());
     return `${API}/files/${selected.document_id}/page-image?${params.toString()}`;
   }, [selected, query]);
+  const activeSearchMode = SEARCH_MODES.find((mode) => mode.value === searchMode) || SEARCH_MODES[0];
 
   return (
     <main className="app-shell">
@@ -333,9 +340,23 @@ function App() {
           </div>
         </header>
 
+        <div className="search-mode-bar" role="group" aria-label="匹配方式">
+          <span>匹配</span>
+          {SEARCH_MODES.map((mode) => (
+            <button
+              type="button"
+              key={mode.value}
+              className={searchMode === mode.value ? 'active' : ''}
+              onClick={() => setSearchMode(mode.value)}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+
         <div className="result-summary">
           <b>{searchSummaryLabel(query, resultGroups.length, hasMoreResults)}</b>
-          <span>{scope ? `范围：${scope}` : stats?.fts_tokenizer === 'trigram' ? '中文连续匹配' : '全文索引'}</span>
+          <span>{searchModeDetail(activeSearchMode, scope, stats)}</span>
         </div>
 
         <div className="results-list">
@@ -574,19 +595,74 @@ function renderSnippet(snippet, query) {
 
 function highlightPlain(text, query) {
   const value = String(text || '');
-  const q = query.trim();
-  if (!q) return value;
+  const terms = parseSearchTerms(query);
+  if (!terms.length) return value;
   const lower = value.toLocaleLowerCase();
-  const needle = q.toLocaleLowerCase();
-  const index = lower.indexOf(needle);
-  if (index < 0) return value;
+  const ranges = [];
+  for (const term of terms) {
+    const needle = term.toLocaleLowerCase();
+    let start = 0;
+    while (needle && start < lower.length) {
+      const index = lower.indexOf(needle, start);
+      if (index < 0) break;
+      ranges.push([index, index + term.length]);
+      start = index + Math.max(1, term.length);
+    }
+  }
+  const selectedRanges = [];
+  ranges
+    .sort((a, b) => a[0] - b[0] || b[1] - b[0] - (a[1] - a[0]))
+    .forEach((range) => {
+      if (selectedRanges.length && range[0] < selectedRanges[selectedRanges.length - 1][1]) return;
+      selectedRanges.push(range);
+    });
+  if (!selectedRanges.length) return value;
+  const parts = [];
+  let cursor = 0;
+  selectedRanges.forEach(([start, end], index) => {
+    if (start > cursor) parts.push(<React.Fragment key={`text-${index}`}>{value.slice(cursor, start)}</React.Fragment>);
+    parts.push(<mark key={`mark-${index}`}>{value.slice(start, end)}</mark>);
+    cursor = end;
+  });
+  if (cursor < value.length) parts.push(<React.Fragment key="tail">{value.slice(cursor)}</React.Fragment>);
   return (
     <>
-      {value.slice(0, index)}
-      <mark>{value.slice(index, index + q.length)}</mark>
-      {value.slice(index + q.length)}
+      {parts}
     </>
   );
+}
+
+function parseSearchTerms(value) {
+  const text = String(value || '').trim();
+  if (!text) return [];
+  const terms = [];
+  let current = '';
+  let quoteEnd = '';
+  const quotePairs = { '"': '"', "'": "'", '“': '”', '‘': '’' };
+  const separators = new Set([',', '，', '、', ';', '；']);
+  const flush = () => {
+    const term = current.trim().replace(/\s+/g, ' ');
+    current = '';
+    if (term) terms.push(term);
+  };
+  for (const char of text) {
+    if (quoteEnd) {
+      if (char === quoteEnd) quoteEnd = '';
+      else current += char;
+      continue;
+    }
+    if (quotePairs[char]) {
+      quoteEnd = quotePairs[char];
+      continue;
+    }
+    if (/\s/.test(char) || separators.has(char)) {
+      flush();
+      continue;
+    }
+    current += char;
+  }
+  flush();
+  return terms;
 }
 
 function jobIcon(status) {
@@ -603,6 +679,12 @@ function formatNumber(value) {
 function searchSummaryLabel(query, count, hasMore) {
   if (!query.trim()) return '输入关键词开始检索';
   return hasMore ? `已显示 ${count}+ 个文件` : `${count} 个文件`;
+}
+
+function searchModeDetail(activeSearchMode, scope, stats) {
+  const indexLabel = scope ? `范围：${scope}` : stats?.fts_tokenizer === 'trigram' ? '中文连续匹配' : '全文索引';
+  if (activeSearchMode.value === 'basic') return indexLabel;
+  return `${activeSearchMode.label} · ${indexLabel}`;
 }
 
 function fileTypeLabel(ext) {
@@ -664,19 +746,21 @@ async function getJson(url) {
   return response.json();
 }
 
-async function fetchSearchGroups(query, scope, offset) {
+async function fetchSearchGroups(query, scope, mode, offset) {
   const params = new URLSearchParams({
     q: query,
     scope,
+    mode,
     limit: String(SEARCH_GROUP_PAGE_SIZE),
     offset: String(offset),
   });
   return getJson(`${API}/search/groups?${params.toString()}`);
 }
 
-async function fetchDocumentSearchResults(query, documentId, offset) {
+async function fetchDocumentSearchResults(query, documentId, mode, offset) {
   const params = new URLSearchParams({
     q: query,
+    mode,
     limit: String(DOCUMENT_HIT_PAGE_SIZE),
     offset: String(offset),
   });

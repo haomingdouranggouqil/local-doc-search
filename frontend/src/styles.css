@@ -312,6 +312,49 @@ input {
   border-bottom: 1px solid var(--border);
 }
 
+.search-mode-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  max-width: 100%;
+  margin-top: 12px;
+  padding: 4px;
+  color: var(--muted);
+  background: #eef3f5;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.search-mode-bar span {
+  padding: 0 7px;
+  white-space: nowrap;
+}
+
+.search-mode-bar button {
+  height: 28px;
+  padding: 0 10px;
+  color: #46525d;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.search-mode-bar button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.search-mode-bar button.active {
+  color: #145d6b;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(28, 39, 48, 0.12);
+  font-weight: 700;
+}
+
 .search-box {
   display: flex;
   align-items: center;
@@ -836,6 +879,11 @@ mark {
   .result-title {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .search-mode-bar {
+    width: 100%;
+    overflow-x: auto;
   }
 
   .scope-select,

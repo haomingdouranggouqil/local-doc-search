@@ -220,6 +220,160 @@ class DatabaseSearchTests(unittest.TestCase):
             self.assertEqual(1, len(page["results"]))
             self.assertEqual("doc2", page["results"][0]["document_id"])
 
+    def test_advanced_line_search_requires_all_terms_in_same_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            for document_id, chunks in (
+                (
+                    "same-line",
+                    [
+                        {
+                            "ordinal": 0,
+                            "line": 1,
+                            "text": "郑孝胥与袁世凯同在一行",
+                            "source": "text",
+                        },
+                        {
+                            "ordinal": 1,
+                            "line": 2,
+                            "text": "郑孝胥单独出现",
+                            "source": "text",
+                        },
+                    ],
+                ),
+                (
+                    "same-file",
+                    [
+                        {
+                            "ordinal": 0,
+                            "line": 1,
+                            "text": "郑孝胥单独一行",
+                            "source": "text",
+                        },
+                        {
+                            "ordinal": 1,
+                            "line": 2,
+                            "text": "袁世凯单独一行",
+                            "source": "text",
+                        },
+                    ],
+                ),
+            ):
+                db.upsert_document(
+                    {
+                        "id": document_id,
+                        "path": str(root / f"{document_id}.txt"),
+                        "rel_path": f"txt/{document_id}.txt",
+                        "title": f"{document_id}.txt",
+                        "ext": ".txt",
+                        "size": 1,
+                        "mtime": 1.0,
+                        "sha256": f"hash-{document_id}",
+                        "status": "queued",
+                    }
+                )
+                db.replace_chunks(
+                    document_id,
+                    chunks,
+                    status="ready",
+                    searchable_pdf=None,
+                    page_count=0,
+                    text_chars=100,
+                    has_text_layer=True,
+                )
+
+            groups = db.search_groups_page("郑孝胥 袁世凯", mode="line", limit=10)
+            same_file_hits = db.search_document_page(
+                "郑孝胥 袁世凯", "same-file", mode="line", limit=10
+            )
+
+            self.assertEqual(1, len(groups["groups"]))
+            self.assertEqual("same-line", groups["groups"][0]["document_id"])
+            self.assertEqual(1, groups["groups"][0]["match_count"])
+            self.assertIn("<mark>郑孝胥</mark>", groups["groups"][0]["snippet"])
+            self.assertIn("<mark>袁世凯</mark>", groups["groups"][0]["snippet"])
+            self.assertEqual([], same_file_hits["results"])
+
+    def test_advanced_document_search_allows_terms_in_different_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            for document_id, chunks in (
+                (
+                    "same-line",
+                    [
+                        {
+                            "ordinal": 0,
+                            "line": 1,
+                            "text": "郑孝胥与袁世凯同在一行",
+                            "source": "text",
+                        }
+                    ],
+                ),
+                (
+                    "same-file",
+                    [
+                        {
+                            "ordinal": 0,
+                            "line": 1,
+                            "text": "郑孝胥单独一行",
+                            "source": "text",
+                        },
+                        {
+                            "ordinal": 1,
+                            "line": 2,
+                            "text": "袁世凯单独一行",
+                            "source": "text",
+                        },
+                    ],
+                ),
+                (
+                    "missing-term",
+                    [
+                        {
+                            "ordinal": 0,
+                            "line": 1,
+                            "text": "只有郑孝胥",
+                            "source": "text",
+                        }
+                    ],
+                ),
+            ):
+                db.upsert_document(
+                    {
+                        "id": document_id,
+                        "path": str(root / f"{document_id}.txt"),
+                        "rel_path": f"txt/{document_id}.txt",
+                        "title": f"{document_id}.txt",
+                        "ext": ".txt",
+                        "size": 1,
+                        "mtime": 1.0,
+                        "sha256": f"hash-{document_id}",
+                        "status": "queued",
+                    }
+                )
+                db.replace_chunks(
+                    document_id,
+                    chunks,
+                    status="ready",
+                    searchable_pdf=None,
+                    page_count=0,
+                    text_chars=100,
+                    has_text_layer=True,
+                )
+
+            groups = db.search_groups_page("郑孝胥 袁世凯", mode="document", limit=10)
+            same_file_hits = db.search_document_page(
+                "郑孝胥 袁世凯", "same-file", mode="document", limit=10
+            )
+
+            group_ids = {group["document_id"] for group in groups["groups"]}
+            self.assertEqual({"same-line", "same-file"}, group_ids)
+            self.assertEqual(2, len(same_file_hits["results"]))
+            self.assertEqual(["same-file", "same-file"], [row["document_id"] for row in same_file_hits["results"]])
+            self.assertNotIn("missing-term", group_ids)
+
     def test_file_change_keeps_previous_chunks_until_reindex_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
