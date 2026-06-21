@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 
 from .config import get_settings
 from .database import Database
@@ -18,6 +19,7 @@ from .indexer import DocumentIndexer
 from .pdf_preview import render_highlighted_page_png
 from .quota import current_quota_day
 from .resources import ResourcePolicy
+from .runtime_config import write_runtime_secrets
 from .scanner import DocumentScanner, run_scan_loop, run_worker_loop
 
 settings = get_settings()
@@ -27,6 +29,11 @@ scanner = DocumentScanner(settings, db, resources)
 indexer = DocumentIndexer(settings, db, resources)
 stop_event = threading.Event()
 threads: list[threading.Thread] = []
+
+
+class TokenConfigPayload(BaseModel):
+    paddleocr_api_token: str | None = None
+    deepseek_api_key: str | None = None
 
 
 @asynccontextmanager
@@ -77,6 +84,7 @@ def stats() -> dict[str, Any]:
         "model": settings.paddleocr_api_model,
         "configured_device": settings.ocr_device,
         "actual_device": indexer.ocr_engine.actual_device,
+        "tokens": settings.token_status,
         "quota": {
             "date": quota_day.date,
             "timezone": quota_day.timezone,
@@ -88,6 +96,23 @@ def stats() -> dict[str, Any]:
     }
     data["resources"] = resources.as_dict()
     return data
+
+
+@app.post("/api/config/tokens")
+def configure_tokens(payload: TokenConfigPayload) -> dict[str, Any]:
+    updates: dict[str, str] = {}
+    if payload.paddleocr_api_token is not None:
+        token = payload.paddleocr_api_token.strip()
+        if token:
+            updates["paddleocr_api_token"] = token
+    if payload.deepseek_api_key is not None:
+        token = payload.deepseek_api_key.strip()
+        if token:
+            updates["deepseek_api_key"] = token
+    if not updates:
+        raise HTTPException(status_code=400, detail="no token provided")
+    write_runtime_secrets(settings.runtime_config_path, updates)
+    return {"ok": True, "tokens": settings.token_status}
 
 
 @app.post("/api/scan")

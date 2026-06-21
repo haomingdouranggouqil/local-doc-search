@@ -122,7 +122,7 @@ class PaddleOcrApiClient:
         source_pdf: Path,
         progress_callback: ProgressCallback | None = None,
     ) -> list[OcrPageResult]:
-        if not self.settings.paddleocr_api_token:
+        if not self.settings.effective_paddleocr_api_token:
             raise PaddleOcrApiError("PADDLEOCR_API_TOKEN is not configured")
         if not source_pdf.exists():
             raise PaddleOcrApiError(f"File not found: {source_pdf}")
@@ -145,7 +145,7 @@ class PaddleOcrApiClient:
     @property
     def headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"bearer {self.settings.paddleocr_api_token}",
+            "Authorization": f"bearer {self.settings.effective_paddleocr_api_token}",
             "User-Agent": "local-doc-search/1.0",
         }
 

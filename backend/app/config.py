@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .runtime_config import runtime_secret
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -83,6 +85,29 @@ class Settings(BaseSettings):
     @property
     def temp_dir(self) -> Path:
         return self.state_dir / "tmp"
+
+    @property
+    def runtime_config_path(self) -> Path:
+        return self.state_dir / "runtime-config.json"
+
+    @property
+    def effective_paddleocr_api_token(self) -> str:
+        return self.paddleocr_api_token.strip() or runtime_secret(
+            self.runtime_config_path, "paddleocr_api_token"
+        )
+
+    @property
+    def effective_deepseek_api_key(self) -> str:
+        return self.deepseek_api_key.strip() or runtime_secret(
+            self.runtime_config_path, "deepseek_api_key"
+        )
+
+    @property
+    def token_status(self) -> dict[str, bool]:
+        return {
+            "paddleocr_api_token_configured": bool(self.effective_paddleocr_api_token),
+            "deepseek_api_key_configured": bool(self.effective_deepseek_api_key),
+        }
 
     @property
     def exclude_names(self) -> set[str]:

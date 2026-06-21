@@ -95,6 +95,8 @@ Copy-Item .env.example .env
 PADDLEOCR_API_TOKEN=
 ```
 
+也可以先不填 token 直接启动。首次打开网页时，如果 `PADDLEOCR_API_TOKEN` 或 `DEEPSEEK_API_KEY` 未配置，左侧 `OCR 设备` 卡片会显示输入框；保存后配置会写入 `.docsearch/runtime-config.json`，后端和 worker 会在后续任务中直接使用。
+
 3. 把资料放进 `data/`，例如：
 
 ```text

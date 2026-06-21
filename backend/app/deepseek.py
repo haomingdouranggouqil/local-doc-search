@@ -23,7 +23,8 @@ def extract_publication_info(
 ) -> PublicationResult:
     if not settings.publication_extract_enabled:
         return PublicationResult(status="disabled", info=None, citation=None)
-    if not settings.deepseek_api_key:
+    api_key = settings.effective_deepseek_api_key
+    if not api_key:
         return PublicationResult(status="missing_key", info=None, citation=None)
 
     payload_text = trim_payload(first_pages, last_pages, settings.deepseek_max_chars)
@@ -65,7 +66,7 @@ def extract_publication_info(
         response = httpx.post(
             f"{settings.deepseek_base_url.rstrip('/')}/chat/completions",
             headers={
-                "Authorization": f"Bearer {settings.deepseek_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={

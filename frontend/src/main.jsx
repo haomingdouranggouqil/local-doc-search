@@ -46,6 +46,8 @@ function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
   const [retryFailedOnScan, setRetryFailedOnScan] = useState(false);
+  const [tokenForm, setTokenForm] = useState({ paddleocr_api_token: '', deepseek_api_key: '' });
+  const [tokenSaveState, setTokenSaveState] = useState({ saving: false, error: '', saved: false });
   const [openStatus, setOpenStatus] = useState(null);
   const searchRequestRef = useRef(0);
 
@@ -121,6 +123,23 @@ function App() {
       await refreshStatus();
     } finally {
       setScanLoading(false);
+    }
+  }
+
+  async function saveApiTokens(event) {
+    event.preventDefault();
+    setTokenSaveState({ saving: true, error: '', saved: false });
+    try {
+      await postJson(`${API}/config/tokens`, {
+        paddleocr_api_token: tokenForm.paddleocr_api_token,
+        deepseek_api_key: tokenForm.deepseek_api_key,
+      });
+      setTokenForm({ paddleocr_api_token: '', deepseek_api_key: '' });
+      await refreshStatus();
+      setTokenSaveState({ saving: false, error: '', saved: true });
+      window.setTimeout(() => setTokenSaveState((current) => ({ ...current, saved: false })), 2400);
+    } catch (error) {
+      setTokenSaveState({ saving: false, error: error.message || '保存失败', saved: false });
     }
   }
 
@@ -250,7 +269,13 @@ function App() {
         <section className="status-stack">
           <Metric icon={<Database size={18} />} label="已索引" value={stats?.documents?.ready ?? 0} />
           <Metric icon={<FolderSync size={18} />} label="待处理" value={stats?.jobs?.queued ?? 0} tone="amber" />
-          <Metric icon={<Cpu size={18} />} label="OCR 设备" value={ocrDeviceLabel(stats)} tone={isGpuReady(stats) ? 'blue' : 'green'} />
+          <OcrDeviceMetric
+            stats={stats}
+            tokenForm={tokenForm}
+            tokenSaveState={tokenSaveState}
+            onTokenChange={setTokenForm}
+            onSave={saveApiTokens}
+          />
           <Metric icon={<Gauge size={18} />} label="资源策略" value={resourceLimitLabel(stats)} tone="blue" />
         </section>
 
@@ -535,6 +560,72 @@ function Metric({ icon, label, value, tone = 'neutral' }) {
   );
 }
 
+function OcrDeviceMetric({ stats, tokenForm, tokenSaveState, onTokenChange, onSave }) {
+  const tokens = stats?.ocr?.tokens || {};
+  const needsPaddleToken = stats?.ocr?.engine === 'api' && !tokens.paddleocr_api_token_configured;
+  const needsDeepSeekKey = stats?.ocr?.engine === 'api' && !tokens.deepseek_api_key_configured;
+  const needsSetup = needsPaddleToken || needsDeepSeekKey;
+  if (!needsSetup) {
+    return (
+      <Metric
+        icon={<Cpu size={18} />}
+        label="OCR 设备"
+        value={ocrDeviceLabel(stats)}
+        tone={isGpuReady(stats) ? 'blue' : 'green'}
+      />
+    );
+  }
+
+  const canSave =
+    (!needsPaddleToken || tokenForm.paddleocr_api_token.trim()) &&
+    (!needsDeepSeekKey || tokenForm.deepseek_api_key.trim()) &&
+    !tokenSaveState.saving;
+
+  return (
+    <form className="metric token-metric" onSubmit={onSave}>
+      <Cpu size={18} />
+      <div>
+        <span>OCR 设备</span>
+        <b>配置 API Token</b>
+        <div className="token-input-stack">
+          {needsPaddleToken ? (
+            <input
+              type="password"
+              value={tokenForm.paddleocr_api_token}
+              onChange={(event) =>
+                onTokenChange((current) => ({ ...current, paddleocr_api_token: event.target.value }))
+              }
+              placeholder="PADDLEOCR_API_TOKEN"
+              autoComplete="off"
+            />
+          ) : (
+            <small>PaddleOCR 已配置</small>
+          )}
+          {needsDeepSeekKey ? (
+            <input
+              type="password"
+              value={tokenForm.deepseek_api_key}
+              onChange={(event) =>
+                onTokenChange((current) => ({ ...current, deepseek_api_key: event.target.value }))
+              }
+              placeholder="DEEPSEEK_API_KEY"
+              autoComplete="off"
+            />
+          ) : (
+            <small>DeepSeek 已配置</small>
+          )}
+          <button type="submit" disabled={!canSave}>
+            {tokenSaveState.saving ? <Loader2 className="spin" size={13} /> : null}
+            保存
+          </button>
+          {tokenSaveState.error && <small className="token-error">{tokenSaveState.error}</small>}
+          {tokenSaveState.saved && <small className="token-ok">已保存</small>}
+        </div>
+      </div>
+    </form>
+  );
+}
+
 function PdfPagePreview({ src, page }) {
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -767,8 +858,15 @@ async function fetchDocumentSearchResults(query, documentId, mode, offset) {
   return getJson(`${API}/search/document/${encodeURIComponent(documentId)}?${params.toString()}`);
 }
 
-async function postJson(url) {
-  const response = await fetch(url, { method: 'POST' });
+async function postJson(url, body) {
+  const options = body
+    ? {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }
+    : { method: 'POST' };
+  const response = await fetch(url, options);
   if (!response.ok) throw new Error(`POST ${url} failed`);
   return response.json();
 }
