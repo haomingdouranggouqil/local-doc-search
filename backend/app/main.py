@@ -274,6 +274,24 @@ def jobs(limit: int = Query(default=30, ge=1, le=100)) -> dict[str, Any]:
     return {"jobs": [dict(row) for row in db.recent_jobs(limit)]}
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: int) -> dict[str, Any]:
+    job = db.cancel_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    db.record_event("cancel", f"Cancelled job: {job.get('rel_path')}", job.get("document_id"), job.get("rel_path"))
+    return {"job": job}
+
+
+@app.post("/api/jobs/{job_id}/restart")
+def restart_job(job_id: int) -> dict[str, Any]:
+    job = db.restart_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    db.record_event("retry", f"Restarted job: {job.get('rel_path')}", job.get("document_id"), job.get("rel_path"))
+    return {"job": job}
+
+
 @app.get("/api/events")
 def events(limit: int = Query(default=30, ge=1, le=100)) -> dict[str, Any]:
     return {"events": [dict(row) for row in db.recent_events(limit)]}

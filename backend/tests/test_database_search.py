@@ -220,6 +220,92 @@ class DatabaseSearchTests(unittest.TestCase):
             self.assertEqual(1, len(page["results"]))
             self.assertEqual("doc2", page["results"][0]["document_id"])
 
+    def test_search_document_page_orders_hits_by_file_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            db.upsert_document(
+                {
+                    "id": "doc",
+                    "path": str(root / "sample.txt"),
+                    "rel_path": "txt/sample.txt",
+                    "title": "sample.txt",
+                    "ext": ".txt",
+                    "size": 1,
+                    "mtime": 1.0,
+                    "sha256": "hash",
+                    "status": "queued",
+                }
+            )
+            db.replace_chunks(
+                "doc",
+                [
+                    {"ordinal": 0, "line": 1, "text": "alpha first", "source": "text"},
+                    {
+                        "ordinal": 1,
+                        "line": 2,
+                        "text": "alpha alpha alpha alpha second",
+                        "source": "text",
+                    },
+                    {"ordinal": 2, "line": 3, "text": "alpha third", "source": "text"},
+                ],
+                status="ready",
+                searchable_pdf=None,
+                page_count=0,
+                text_chars=100,
+                has_text_layer=True,
+            )
+
+            page = db.search_document_page("alpha", document_id="doc", limit=10)
+
+            self.assertEqual([0, 1, 2], [row["ordinal"] for row in page["results"]])
+
+    def test_advanced_document_hits_keep_file_position_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            db.upsert_document(
+                {
+                    "id": "doc",
+                    "path": str(root / "sample.txt"),
+                    "rel_path": "txt/sample.txt",
+                    "title": "sample.txt",
+                    "ext": ".txt",
+                    "size": 1,
+                    "mtime": 1.0,
+                    "sha256": "hash",
+                    "status": "queued",
+                }
+            )
+            db.replace_chunks(
+                "doc",
+                [
+                    {"ordinal": 0, "line": 1, "text": "alpha beta first", "source": "text"},
+                    {
+                        "ordinal": 1,
+                        "line": 2,
+                        "text": "alpha beta alpha beta second",
+                        "source": "text",
+                    },
+                    {"ordinal": 2, "line": 3, "text": "alpha third", "source": "text"},
+                ],
+                status="ready",
+                searchable_pdf=None,
+                page_count=0,
+                text_chars=100,
+                has_text_layer=True,
+            )
+
+            line_page = db.search_document_page(
+                "alpha beta", document_id="doc", mode="line", limit=10
+            )
+            document_page = db.search_document_page(
+                "alpha beta", document_id="doc", mode="document", limit=10
+            )
+
+            self.assertEqual([0, 1], [row["ordinal"] for row in line_page["results"]])
+            self.assertEqual([0, 1, 2], [row["ordinal"] for row in document_page["results"]])
+
     def test_advanced_line_search_requires_all_terms_in_same_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -498,6 +584,47 @@ class DatabaseOcrUsageTests(unittest.TestCase):
 
 
 class DatabaseJobCleanupTests(unittest.TestCase):
+    def test_cancelled_job_can_be_restarted_without_old_worker_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            db.upsert_document(
+                {
+                    "id": "doc1",
+                    "path": str(root / "sample.pdf"),
+                    "rel_path": "pdf/sample.pdf",
+                    "title": "sample.pdf",
+                    "ext": ".pdf",
+                    "size": 1,
+                    "mtime": 1.0,
+                    "sha256": "hash",
+                    "status": "queued",
+                }
+            )
+            db.enqueue_job("doc1")
+            claimed = db.claim_next_job()
+            self.assertIsNotNone(claimed)
+
+            cancelled = db.cancel_job(claimed["id"])
+            db.update_job(claimed["id"], status="done", progress=1, message="Done")
+
+            self.assertEqual("cancelled", cancelled["status"])
+            with db.connect() as con:
+                row = con.execute(
+                    "SELECT status, message FROM jobs WHERE id = ?", (claimed["id"],)
+                ).fetchone()
+            self.assertEqual("cancelled", row["status"])
+            self.assertNotEqual("Done", row["message"])
+
+            restarted = db.restart_job(claimed["id"])
+
+            self.assertIsNotNone(restarted)
+            self.assertEqual("queued", restarted["status"])
+            self.assertNotEqual(claimed["id"], restarted["id"])
+            stats = db.stats()
+            self.assertEqual(1, stats["jobs"]["queued"])
+            self.assertEqual(0, stats["jobs"]["processing"])
+
     def test_deleted_documents_do_not_leave_active_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

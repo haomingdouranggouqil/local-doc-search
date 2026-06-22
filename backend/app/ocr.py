@@ -15,6 +15,7 @@ from .config import Settings
 from .resources import ResourcePolicy
 
 ProgressCallback = Callable[[float, int, str], None]
+CancellationCallback = Callable[[], None]
 
 
 @dataclass
@@ -46,6 +47,19 @@ class PaddleOcrApiError(RuntimeError):
     pass
 
 
+class CancellableFile:
+    def __init__(self, handle, cancel_callback: CancellationCallback):
+        self._handle = handle
+        self._cancel_callback = cancel_callback
+
+    def read(self, *args, **kwargs):
+        self._cancel_callback()
+        return self._handle.read(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._handle, name)
+
+
 class PaddleOcrEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -56,17 +70,22 @@ class PaddleOcrEngine:
         self,
         source_pdf: Path,
         progress_callback: ProgressCallback | None = None,
+        cancel_callback: CancellationCallback | None = None,
     ) -> list[OcrPageResult]:
+        if cancel_callback:
+            cancel_callback()
         batch_pages = int(getattr(self.settings, "paddleocr_api_batch_pages", 0) or 0)
         if batch_pages > 0:
             try:
                 with fitz.open(source_pdf) as doc:
                     page_count = doc.page_count
             except Exception:
-                page_count = 0
+                    page_count = 0
             if page_count > batch_pages:
-                return self._recognize_pdf_in_batches(source_pdf, page_count, batch_pages, progress_callback)
-        return self._client.ocr_pdf(source_pdf, progress_callback)
+                return self._recognize_pdf_in_batches(
+                    source_pdf, page_count, batch_pages, progress_callback, cancel_callback
+                )
+        return self._client.ocr_pdf(source_pdf, progress_callback, cancel_callback)
 
     def _recognize_pdf_in_batches(
         self,
@@ -74,12 +93,15 @@ class PaddleOcrEngine:
         page_count: int,
         batch_pages: int,
         progress_callback: ProgressCallback | None,
+        cancel_callback: CancellationCallback | None,
     ) -> list[OcrPageResult]:
         temp_dir = Path(getattr(self.settings, "temp_dir", source_pdf.parent))
         temp_dir.mkdir(parents=True, exist_ok=True)
         pages: list[OcrPageResult] = []
         with fitz.open(source_pdf) as doc:
             for start in range(0, page_count, batch_pages):
+                if cancel_callback:
+                    cancel_callback()
                 end = min(page_count, start + batch_pages)
                 chunk_pdf = temp_dir / (
                     f"{source_pdf.stem}.{uuid.uuid4().hex}.pages-{start + 1}-{end}.pdf"
@@ -96,6 +118,8 @@ class PaddleOcrEngine:
                         )
 
                     def chunk_progress(done: float, _total: int, message: str) -> None:
+                        if cancel_callback:
+                            cancel_callback()
                         if not progress_callback:
                             return
                         bounded_done = max(0.0, min(float(done or 0), float(end - start)))
@@ -105,7 +129,7 @@ class PaddleOcrEngine:
                             f"{message} pages {start + 1}-{end}",
                         )
 
-                    for page in self._client.ocr_pdf(chunk_pdf, chunk_progress):
+                    for page in self._client.ocr_pdf(chunk_pdf, chunk_progress, cancel_callback):
                         page.page_number = start + max(1, int(page.page_number or 1))
                         pages.append(page)
                 finally:
@@ -121,7 +145,10 @@ class PaddleOcrApiClient:
         self,
         source_pdf: Path,
         progress_callback: ProgressCallback | None = None,
+        cancel_callback: CancellationCallback | None = None,
     ) -> list[OcrPageResult]:
+        if cancel_callback:
+            cancel_callback()
         if not self.settings.effective_paddleocr_api_token:
             raise PaddleOcrApiError("PADDLEOCR_API_TOKEN is not configured")
         if not source_pdf.exists():
@@ -134,12 +161,14 @@ class PaddleOcrApiClient:
             ),
             follow_redirects=True,
         ) as client:
+            if cancel_callback:
+                cancel_callback()
             job_id = self._with_transport_retries(
                 "submit OCR job",
-                lambda: self._submit_file(client, source_pdf),
+                lambda: self._submit_file(client, source_pdf, cancel_callback),
             )
-            jsonl_url = self._poll_job(client, job_id, progress_callback)
-            jsonl_text = self._download_jsonl(client, jsonl_url)
+            jsonl_url = self._poll_job(client, job_id, progress_callback, cancel_callback)
+            jsonl_text = self._download_jsonl(client, jsonl_url, cancel_callback)
         return parse_api_jsonl(jsonl_text)
 
     @property
@@ -149,7 +178,14 @@ class PaddleOcrApiClient:
             "User-Agent": "local-doc-search/1.0",
         }
 
-    def _submit_file(self, client: httpx.Client, source_pdf: Path) -> str:
+    def _submit_file(
+        self,
+        client: httpx.Client,
+        source_pdf: Path,
+        cancel_callback: CancellationCallback | None = None,
+    ) -> str:
+        if cancel_callback:
+            cancel_callback()
         optional_payload = {
             "useDocOrientationClassify": self.settings.paddleocr_use_doc_orientation_classify,
             "useDocUnwarping": self.settings.paddleocr_use_doc_unwarping,
@@ -160,7 +196,8 @@ class PaddleOcrApiClient:
             "optionalPayload": json.dumps(optional_payload),
         }
         with source_pdf.open("rb") as handle:
-            files = {"file": (source_pdf.name, handle, "application/pdf")}
+            file_obj = CancellableFile(handle, cancel_callback) if cancel_callback else handle
+            files = {"file": (source_pdf.name, file_obj, "application/pdf")}
             response = client.post(
                 self.settings.paddleocr_api_url,
                 headers=self.headers,
@@ -178,10 +215,13 @@ class PaddleOcrApiClient:
         client: httpx.Client,
         job_id: str,
         progress_callback: ProgressCallback | None,
+        cancel_callback: CancellationCallback | None = None,
     ) -> str:
         deadline = time.monotonic() + self.settings.paddleocr_api_timeout_seconds
         last_message = ""
         while True:
+            if cancel_callback:
+                cancel_callback()
             if time.monotonic() > deadline:
                 raise PaddleOcrApiError(f"OCR API job timed out: {job_id}")
 
@@ -220,7 +260,14 @@ class PaddleOcrApiClient:
 
             raise PaddleOcrApiError(f"Unexpected OCR API state {state!r}: {payload}")
 
-    def _download_jsonl(self, client: httpx.Client, jsonl_url: str) -> str:
+    def _download_jsonl(
+        self,
+        client: httpx.Client,
+        jsonl_url: str,
+        cancel_callback: CancellationCallback | None = None,
+    ) -> str:
+        if cancel_callback:
+            cancel_callback()
         response = self._with_transport_retries(
             "download OCR JSONL",
             lambda: client.get(jsonl_url, headers={"User-Agent": "local-doc-search/1.0"}),
@@ -266,6 +313,7 @@ def make_searchable_pdf(
     engine: PaddleOcrEngine,
     settings: Settings,
     progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancellationCallback | None = None,
     max_pages: int | None = None,
     resources: ResourcePolicy | None = None,
 ) -> OcrPdfResult:
@@ -274,9 +322,11 @@ def make_searchable_pdf(
 
     ocr_input_pdf, cleanup_pdf = prepare_ocr_input_pdf(source_pdf, settings, output_pdf)
     try:
+        if cancel_callback:
+            cancel_callback()
         if progress_callback:
             progress_callback(0, 0, "Uploading PDF to PaddleOCR API")
-        api_pages = engine.recognize_pdf(ocr_input_pdf, progress_callback)
+        api_pages = engine.recognize_pdf(ocr_input_pdf, progress_callback, cancel_callback)
         pages_by_number = {page.page_number: page for page in api_pages}
 
         chunks: list[dict] = []
@@ -288,6 +338,8 @@ def make_searchable_pdf(
             target_page_count = min(page_total, target_page_count)
 
             for page_number in range(1, target_page_count + 1):
+                if cancel_callback:
+                    cancel_callback()
                 page = doc.load_page(page_number - 1)
                 page_result = pages_by_number.get(page_number)
                 if not page_result:

@@ -570,6 +570,114 @@ class Database:
             )
             return True
 
+    def cancel_job(self, job_id: int, reason: str = "Cancelled by user") -> dict[str, Any] | None:
+        ts = now_iso()
+        with self._lock, self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            job = con.execute(
+                """
+                SELECT jobs.*, documents.rel_path, documents.title
+                FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE jobs.id = ? AND documents.deleted = 0
+                """,
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                return None
+            if job["status"] in {"queued", "processing"}:
+                con.execute(
+                    """
+                    UPDATE jobs
+                    SET status='cancelled', progress=1, message=?, error=?,
+                        updated_at=?, finished_at=?
+                    WHERE id=?
+                    """,
+                    (reason, reason, ts, ts, job_id),
+                )
+                active = con.execute(
+                    """
+                    SELECT 1 FROM jobs
+                    WHERE document_id = ?
+                      AND status IN ('queued', 'processing')
+                    LIMIT 1
+                    """,
+                    (job["document_id"],),
+                ).fetchone()
+                if active is None:
+                    con.execute(
+                        """
+                        UPDATE documents
+                        SET status='error', error=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (reason, ts, job["document_id"]),
+                    )
+            return dict(
+                con.execute(
+                    """
+                    SELECT jobs.*, documents.rel_path, documents.title
+                    FROM jobs
+                    JOIN documents ON documents.id = jobs.document_id
+                    WHERE jobs.id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+            )
+
+    def restart_job(self, job_id: int) -> dict[str, Any] | None:
+        ts = now_iso()
+        with self._lock, self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            job = con.execute(
+                """
+                SELECT jobs.*, documents.rel_path, documents.title
+                FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE jobs.id = ? AND documents.deleted = 0
+                """,
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                return None
+            con.execute(
+                """
+                UPDATE jobs
+                SET status='cancelled', progress=1, message='Restarted by user',
+                    error='Restarted by user', updated_at=?, finished_at=COALESCE(finished_at, ?)
+                WHERE document_id = ?
+                  AND type = ?
+                  AND status IN ('queued', 'processing')
+                """,
+                (ts, ts, job["document_id"], job["type"]),
+            )
+            cur = con.execute(
+                """
+                INSERT INTO jobs(document_id, type, status, priority, progress, message, created_at, updated_at)
+                VALUES(?, ?, 'queued', ?, 0, 'Restart requested', ?, ?)
+                """,
+                (job["document_id"], job["type"], job["priority"], ts, ts),
+            )
+            con.execute(
+                """
+                UPDATE documents
+                SET status='queued', error=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (ts, job["document_id"]),
+            )
+            return dict(
+                con.execute(
+                    """
+                    SELECT jobs.*, documents.rel_path, documents.title
+                    FROM jobs
+                    JOIN documents ON documents.id = jobs.document_id
+                    WHERE jobs.id = ?
+                    """,
+                    (cur.lastrowid,),
+                ).fetchone()
+            )
+
     def claim_next_job(self) -> sqlite3.Row | None:
         ts = now_iso()
         with self._lock, self.connect() as con:
@@ -630,6 +738,11 @@ class Database:
             )
             return len(rows)
 
+    def job_cancelled(self, job_id: int) -> bool:
+        with self.connect() as con:
+            row = con.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return row is not None and row["status"] == "cancelled"
+
     def _cancel_deleted_document_jobs(
         self, con: sqlite3.Connection, ts: str | None = None
     ) -> int:
@@ -676,7 +789,7 @@ class Database:
         if status is not None:
             fields.append("status = ?")
             values.append(status)
-            if status in {"done", "failed"}:
+            if status in {"done", "failed", "cancelled"}:
                 fields.append("finished_at = ?")
                 values.append(now_iso())
         if progress is not None:
@@ -690,6 +803,9 @@ class Database:
             values.append(error)
         values.append(job_id)
         with self._lock, self.connect() as con:
+            current = con.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if current is not None and current["status"] == "cancelled" and status != "cancelled":
+                return
             con.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", values)
 
     def replace_chunks(
@@ -908,6 +1024,9 @@ class Database:
         min_match_chars = 3 if tokenizer == "trigram" else 2
         use_like = len(variants[0]) < min_match_chars
         filter_sql, filter_params = search_document_filters(scope, document_id)
+        single_document = document_id is not None
+        like_order = search_hits_order(fts=False, single_document=single_document)
+        fts_order = search_hits_order(fts=True, single_document=single_document)
         like_clause = " OR ".join("c.text LIKE ?" for _ in variants)
         like_params = [f"%{variant}%" for variant in variants]
         with self.connect() as con:
@@ -922,7 +1041,7 @@ class Database:
                         FROM chunks c
                         JOIN documents d ON d.id = c.document_id
                         WHERE {filter_sql} AND ({like_clause})
-                        ORDER BY d.updated_at DESC, c.page, c.ordinal
+                        ORDER BY {like_order}
                         LIMIT ? OFFSET ?
                         """,
                         (*filter_params, *like_params, limit, offset),
@@ -942,7 +1061,7 @@ class Database:
                         JOIN chunks c ON c.id = chunks_fts.chunk_id
                         JOIN documents d ON d.id = c.document_id
                         WHERE chunks_fts MATCH ? AND {filter_sql}
-                        ORDER BY bm25(chunks_fts), c.page, c.ordinal
+                        ORDER BY {fts_order}
                         LIMIT ? OFFSET ?
                         """,
                         (expr, *filter_params, limit, offset),
@@ -960,7 +1079,7 @@ class Database:
                         FROM chunks c
                         JOIN documents d ON d.id = c.document_id
                         WHERE {filter_sql} AND ({like_clause})
-                        ORDER BY d.updated_at DESC, c.page, c.ordinal
+                        ORDER BY {like_order}
                         LIMIT ? OFFSET ?
                         """,
                         (*filter_params, *like_params, limit, offset),
@@ -1074,12 +1193,25 @@ class Database:
             return []
         filter_sql, filter_params = search_document_filters(scope, document_id)
         variants = flatten_search_variants(variants_by_term)
+        single_document = document_id is not None
         if search_mode == "document":
             return self._search_document_terms(
-                variants_by_term, variants, filter_sql, filter_params, limit, offset
+                variants_by_term,
+                variants,
+                filter_sql,
+                filter_params,
+                limit,
+                offset,
+                single_document,
             )
         return self._search_same_chunk_terms(
-            variants_by_term, variants, filter_sql, filter_params, limit, offset
+            variants_by_term,
+            variants,
+            filter_sql,
+            filter_params,
+            limit,
+            offset,
+            single_document,
         )
 
     def search_advanced_groups(
@@ -1107,9 +1239,12 @@ class Database:
         filter_params: list[Any],
         limit: int,
         offset: int,
+        single_document: bool = False,
     ) -> list[dict[str, Any]]:
         all_terms_clause, all_terms_params = all_terms_like_clause("c", variants_by_term)
         fts_expr = fts_prefilter_expr(variants_by_term, self.fts_tokenizer())
+        fts_order = search_hits_order(fts=True, single_document=single_document)
+        like_order = search_hits_order(fts=False, single_document=single_document)
         if fts_expr:
             try:
                 with self.connect() as con:
@@ -1124,7 +1259,7 @@ class Database:
                             JOIN chunks c ON c.id = chunks_fts.chunk_id
                             JOIN documents d ON d.id = c.document_id
                             WHERE chunks_fts MATCH ? AND {filter_sql} AND {all_terms_clause}
-                            ORDER BY bm25(chunks_fts), c.page, c.ordinal
+                            ORDER BY {fts_order}
                             LIMIT ? OFFSET ?
                             """,
                             (fts_expr, *filter_params, *all_terms_params, limit, offset),
@@ -1144,7 +1279,7 @@ class Database:
                     FROM chunks c
                     JOIN documents d ON d.id = c.document_id
                     WHERE {filter_sql} AND {all_terms_clause}
-                    ORDER BY d.updated_at DESC, c.page, c.ordinal
+                    ORDER BY {like_order}
                     LIMIT ? OFFSET ?
                     """,
                     (*filter_params, *all_terms_params, limit, offset),
@@ -1183,9 +1318,10 @@ class Database:
                             ranked AS (
                                 SELECT *,
                                        COUNT(*) OVER (PARTITION BY document_id) AS match_count,
+                                       MIN(rank) OVER (PARTITION BY document_id) AS best_rank,
                                        ROW_NUMBER() OVER (
                                            PARTITION BY document_id
-                                           ORDER BY rank, COALESCE(page, 0), ordinal, match_id
+                                           ORDER BY COALESCE(page, 0), ordinal, match_id
                                        ) AS group_row
                                 FROM matches
                             )
@@ -1194,7 +1330,7 @@ class Database:
                                    publication_status, publication_info, match_count
                             FROM ranked
                             WHERE group_row = 1
-                            ORDER BY match_count DESC, rank, updated_at DESC
+                            ORDER BY match_count DESC, best_rank, updated_at DESC
                             LIMIT ? OFFSET ?
                             """,
                             (fts_expr, *filter_params, *all_terms_params, limit, offset),
@@ -1247,11 +1383,14 @@ class Database:
         filter_params: list[Any],
         limit: int,
         offset: int,
+        single_document: bool = False,
     ) -> list[dict[str, Any]]:
         cte_sql, cte_params = qualified_documents_cte(
             variants_by_term, filter_sql, filter_params, self.fts_tokenizer()
         )
         fts_any_expr = fts_any_terms_expr(variants_by_term, self.fts_tokenizer())
+        fts_order = search_hits_order(fts=True, single_document=single_document)
+        like_order = search_hits_order(fts=False, single_document=single_document)
         if fts_any_expr:
             try:
                 with self.connect() as con:
@@ -1268,7 +1407,7 @@ class Database:
                             JOIN qualified_documents q ON q.document_id = c.document_id
                             JOIN documents d ON d.id = c.document_id
                             WHERE chunks_fts MATCH ?
-                            ORDER BY bm25(chunks_fts), c.page, c.ordinal
+                            ORDER BY {fts_order}
                             LIMIT ? OFFSET ?
                             """,
                             (*cte_params, fts_any_expr, limit, offset),
@@ -1291,7 +1430,7 @@ class Database:
                     JOIN qualified_documents q ON q.document_id = c.document_id
                     JOIN documents d ON d.id = c.document_id
                     WHERE {any_terms_clause}
-                    ORDER BY d.updated_at DESC, c.page, c.ordinal
+                    ORDER BY {like_order}
                     LIMIT ? OFFSET ?
                     """,
                     (*cte_params, *any_terms_params, limit, offset),
@@ -1334,9 +1473,10 @@ class Database:
                             ranked AS (
                                 SELECT *,
                                        COUNT(*) OVER (PARTITION BY document_id) AS match_count,
+                                       MIN(rank) OVER (PARTITION BY document_id) AS best_rank,
                                        ROW_NUMBER() OVER (
                                            PARTITION BY document_id
-                                           ORDER BY rank, COALESCE(page, 0), ordinal, match_id
+                                           ORDER BY COALESCE(page, 0), ordinal, match_id
                                        ) AS group_row
                                 FROM matches
                             )
@@ -1345,7 +1485,7 @@ class Database:
                                    publication_status, publication_info, match_count
                             FROM ranked
                             WHERE group_row = 1
-                            ORDER BY match_count DESC, rank, updated_at DESC
+                            ORDER BY match_count DESC, best_rank, updated_at DESC
                             LIMIT ? OFFSET ?
                             """,
                             (*cte_params, fts_any_expr, limit, offset),
@@ -1425,9 +1565,10 @@ class Database:
                         ranked AS (
                             SELECT *,
                                    COUNT(*) OVER (PARTITION BY document_id) AS match_count,
+                                   MIN(rank) OVER (PARTITION BY document_id) AS best_rank,
                                    ROW_NUMBER() OVER (
                                        PARTITION BY document_id
-                                       ORDER BY rank, COALESCE(page, 0), ordinal, match_id
+                                       ORDER BY COALESCE(page, 0), ordinal, match_id
                                    ) AS group_row
                             FROM matches
                         )
@@ -1436,7 +1577,7 @@ class Database:
                                publication_status, publication_info, match_count
                         FROM ranked
                         WHERE group_row = 1
-                        ORDER BY match_count DESC, rank, updated_at DESC
+                        ORDER BY match_count DESC, best_rank, updated_at DESC
                         LIMIT ? OFFSET ?
                         """,
                         (expr, *filter_params, limit, offset),
@@ -1664,6 +1805,14 @@ def search_document_filters(
         filters.append("d.rel_path LIKE ?")
         params.append(f"{normalized_scope}/%")
     return " AND ".join(filters), params
+
+
+def search_hits_order(fts: bool, single_document: bool) -> str:
+    if single_document:
+        return "COALESCE(c.page, 0), c.ordinal, c.id"
+    if fts:
+        return "bm25(chunks_fts), COALESCE(c.page, 0), c.ordinal, c.id"
+    return "d.updated_at DESC, COALESCE(c.page, 0), c.ordinal, c.id"
 
 
 def normalize_search_mode(value: str | None) -> str:

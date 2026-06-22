@@ -88,7 +88,7 @@ class OcrCoordinateTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.words_seen: list[str] = []
 
-            def recognize_pdf(self, source_pdf: Path, progress_callback=None):
+            def recognize_pdf(self, source_pdf: Path, progress_callback=None, cancel_callback=None):
                 with fitz.open(source_pdf) as doc:
                     self.words_seen = [word[4] for word in doc[0].get_text("words")]
                 return []
@@ -115,6 +115,37 @@ class OcrCoordinateTests(unittest.TestCase):
             with fitz.open(output) as checked:
                 self.assertEqual(["visible", "hidden"], [word[4] for word in checked[0].get_text("words")])
 
+    def test_make_searchable_pdf_checks_cancel_before_ocr_upload(self) -> None:
+        class FakeEngine:
+            actual_device = "api"
+
+            def __init__(self) -> None:
+                self.called = False
+
+            def recognize_pdf(self, source_pdf: Path, progress_callback=None, cancel_callback=None):
+                self.called = True
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "output.pdf"
+            with fitz.open() as doc:
+                doc.new_page(width=200, height=100)
+                doc.save(source)
+
+            engine = FakeEngine()
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                make_searchable_pdf(
+                    source,
+                    output,
+                    engine,  # type: ignore[arg-type]
+                    SimpleNamespace(ocr_max_pages=0, pdf_text_font="helv"),
+                    cancel_callback=lambda: (_ for _ in ()).throw(RuntimeError("cancelled")),
+                )
+
+            self.assertFalse(engine.called)
+
     def test_make_searchable_pdf_only_replaces_pages_with_api_results(self) -> None:
         class FakeEngine:
             actual_device = "api"
@@ -122,7 +153,7 @@ class OcrCoordinateTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.words_seen: list[list[str]] = []
 
-            def recognize_pdf(self, source_pdf: Path, progress_callback=None):
+            def recognize_pdf(self, source_pdf: Path, progress_callback=None, cancel_callback=None):
                 with fitz.open(source_pdf) as doc:
                     self.words_seen = [
                         [word[4] for word in page.get_text("words")]
@@ -179,7 +210,7 @@ class OcrCoordinateTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.batch_page_counts: list[int] = []
 
-            def ocr_pdf(self, source_pdf: Path, progress_callback=None):
+            def ocr_pdf(self, source_pdf: Path, progress_callback=None, cancel_callback=None):
                 with fitz.open(source_pdf) as doc:
                     page_count = doc.page_count
                 self.batch_page_counts.append(page_count)

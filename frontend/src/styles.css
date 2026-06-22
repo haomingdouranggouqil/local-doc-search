@@ -326,6 +326,38 @@ input {
   border-radius: inherit;
 }
 
+.job-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #d6e1e8;
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.job-actions button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.job-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .job-list {
   display: grid;
   gap: 8px;

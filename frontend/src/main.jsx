@@ -13,7 +13,9 @@ import {
   Gauge,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Search,
+  XCircle,
 } from 'lucide-react';
 import './styles.css';
 
@@ -46,6 +48,7 @@ function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
   const [retryFailedOnScan, setRetryFailedOnScan] = useState(false);
+  const [jobAction, setJobAction] = useState({ id: null, type: '' });
   const [tokenForm, setTokenForm] = useState({ paddleocr_api_token: '', deepseek_api_key: '' });
   const [tokenSaveState, setTokenSaveState] = useState({ saving: false, error: '', saved: false });
   const [openStatus, setOpenStatus] = useState(null);
@@ -123,6 +126,17 @@ function App() {
       await refreshStatus();
     } finally {
       setScanLoading(false);
+    }
+  }
+
+  async function controlJob(job, action) {
+    if (!job?.id || jobAction.id) return;
+    setJobAction({ id: job.id, type: action });
+    try {
+      await postJson(`${API}/jobs/${job.id}/${action}`);
+      await refreshStatus();
+    } finally {
+      setJobAction({ id: null, type: '' });
     }
   }
 
@@ -228,7 +242,7 @@ function App() {
     if (!selected) return;
     setOpenStatus({ tone: 'info', message: '正在打开...' });
     try {
-      const data = await openLocalDocument(selected);
+      const data = await openLocalDocument(selected, selectedPdfUrl);
       setOpenStatus({ tone: 'ok', message: openSuccessMessage(data) });
       window.setTimeout(() => setOpenStatus(null), 2200);
     } catch (error) {
@@ -308,6 +322,34 @@ function App() {
               </div>
               <div className="progress-track">
                 <span style={{ width: `${Math.max(4, Math.round((activeJob.progress || 0) * 100))}%` }} />
+              </div>
+              <div className="job-actions">
+                <button
+                  type="button"
+                  onClick={() => controlJob(activeJob, 'cancel')}
+                  disabled={Boolean(jobAction.id)}
+                  title="中止当前处理任务"
+                >
+                  {jobAction.id === activeJob.id && jobAction.type === 'cancel' ? (
+                    <Loader2 className="spin" size={14} />
+                  ) : (
+                    <XCircle size={14} />
+                  )}
+                  中止
+                </button>
+                <button
+                  type="button"
+                  onClick={() => controlJob(activeJob, 'restart')}
+                  disabled={Boolean(jobAction.id)}
+                  title="中止当前任务并重新加入处理队列"
+                >
+                  {jobAction.id === activeJob.id && jobAction.type === 'restart' ? (
+                    <Loader2 className="spin" size={14} />
+                  ) : (
+                    <RotateCcw size={14} />
+                  )}
+                  重新开始
+                </button>
               </div>
             </div>
           ) : (
@@ -871,7 +913,8 @@ async function postJson(url, body) {
   return response.json();
 }
 
-async function openLocalDocument(result) {
+async function openLocalDocument(result, pdfUrl = '') {
+  const errors = [];
   try {
     const response = await fetch(LOCAL_OPEN_HELPER, {
       method: 'POST',
@@ -879,13 +922,11 @@ async function openLocalDocument(result) {
       body: JSON.stringify({ rel_path: result.rel_path }),
     });
     if (!response.ok) {
-      const error = new Error(await responseErrorMessage(response, '本地打开助手返回错误'));
-      error.fromOpenHelper = true;
-      throw error;
+      throw new Error(await responseErrorMessage(response, '本地打开助手返回错误'));
     }
     return response.json().catch(() => ({ ok: true }));
   } catch (error) {
-    if (error.fromOpenHelper) throw error;
+    errors.push(error);
   }
 
   try {
@@ -893,13 +934,27 @@ async function openLocalDocument(result) {
     if (response.ok) return response.json().catch(() => ({ ok: true }));
     throw new Error(await responseErrorMessage(response, '后端无法打开本地文件'));
   } catch (error) {
-    throw new Error('无法打开本地文件，请运行 scripts\\start.ps1 启动本地打开助手');
+    errors.push(error);
   }
+
+  if (pdfUrl) {
+    const opened = window.open(pdfUrl, '_blank');
+    if (opened) {
+      opened.opener = null;
+      return { ok: true, method: 'browser-pdf' };
+    }
+    window.location.assign(pdfUrl);
+    return { ok: true, method: 'browser-pdf-current-tab' };
+  }
+
+  const detail = errors.map((error) => error?.message).filter(Boolean).join('；');
+  throw new Error(detail || '无法打开本地文件，请运行 scripts\\start.ps1 启动本地打开助手');
 }
 
 function openSuccessMessage(data) {
   if (data?.method === 'notepad') return '已调用 Notepad 打开';
   if (data?.method === 'windows-startfile' || data?.method === 'powershell-start-process') return '已请求系统打开';
+  if (data?.method === 'browser-pdf' || data?.method === 'browser-pdf-current-tab') return '已在浏览器中打开 PDF';
   return '已请求打开本地文件';
 }
 

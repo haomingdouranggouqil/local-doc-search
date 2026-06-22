@@ -21,6 +21,10 @@ from .text_extractors import (
 )
 
 
+class JobCancelled(RuntimeError):
+    pass
+
+
 class DocumentIndexer:
     def __init__(self, settings: Settings, db: Database, resources: ResourcePolicy):
         self.settings = settings
@@ -39,8 +43,10 @@ class DocumentIndexer:
 
         try:
             if job_id is not None:
+                self._raise_if_cancelled(job_id)
                 self.db.update_job(job_id, progress=0.05, message="Reading file")
             result, searchable_pdf = self._extract_or_ocr(path, document_id, job_id)
+            self._raise_if_cancelled(job_id)
             status = "ready" if result.text_chars > 0 else "empty"
             self.db.replace_chunks(
                 document_id,
@@ -56,6 +62,17 @@ class DocumentIndexer:
             if job_id is not None:
                 self.db.update_job(job_id, status="done", progress=1, message="Done")
             self.db.record_event("index", f"Indexed: {doc['rel_path']}", document_id, doc["rel_path"])
+        except JobCancelled as exc:
+            if job_id is not None:
+                self.db.update_job(
+                    job_id,
+                    status="cancelled",
+                    progress=1,
+                    message="Cancelled",
+                    error=str(exc),
+                )
+            self.db.fail_document(document_id, str(exc))
+            self.db.record_event("cancel", f"Cancelled: {doc['rel_path']}", document_id, doc["rel_path"])
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.db.fail_document(document_id, error)
@@ -165,6 +182,7 @@ class DocumentIndexer:
         def progress(page: float, total: int, message: str) -> None:
             if job_id is None:
                 return
+            self._raise_if_cancelled(job_id)
             if page <= 0:
                 self.db.update_job(job_id, progress=progress_start, message=message)
                 return
@@ -183,9 +201,11 @@ class DocumentIndexer:
                 self.ocr_engine,
                 self.settings,
                 progress,
+                cancel_callback=(lambda: self._raise_if_cancelled(job_id)) if job_id is not None else None,
                 max_pages=0,
                 resources=self.resources,
             )
+            self._raise_if_cancelled(job_id)
             quota_day = current_quota_day(self.settings.paddleocr_quota_timezone)
             self.db.record_ocr_usage(
                 quota_day.date,
@@ -198,6 +218,10 @@ class DocumentIndexer:
             return ocr_result
         finally:
             output_pdf.unlink(missing_ok=True)
+
+    def _raise_if_cancelled(self, job_id: int | None) -> None:
+        if job_id is not None and self.db.job_cancelled(job_id):
+            raise JobCancelled("Cancelled by user")
 
     def _extract_publication_info(
         self,

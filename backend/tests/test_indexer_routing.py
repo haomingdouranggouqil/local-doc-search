@@ -134,6 +134,7 @@ class IndexerRoutingTests(unittest.TestCase):
                 engine,
                 settings,
                 progress_callback,
+                cancel_callback,
                 max_pages,
                 resources,
             ):
