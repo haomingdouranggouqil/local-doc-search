@@ -176,12 +176,46 @@ def documents(limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
     return {"documents": [dict(row) for row in db.list_documents(limit)]}
 
 
+@app.get("/api/failed-documents")
+def failed_documents(limit: int = Query(default=30, ge=1, le=200)) -> dict[str, Any]:
+    total = db.unsuccessful_document_count()
+    rows = db.list_unsuccessful_documents(limit)
+    return {
+        "documents": [dict(row) for row in rows],
+        "total": total,
+        "has_more": total > len(rows),
+    }
+
+
+@app.post("/api/failed-documents/retry")
+def retry_failed_documents(limit: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
+    requeued = db.requeue_unsuccessful_documents(limit=limit)
+    if requeued:
+        db.record_event("retry", f"Requeued failed documents: {requeued}")
+    return {"requeued": requeued}
+
+
 @app.get("/api/documents/{document_id}")
 def document(document_id: str) -> dict[str, Any]:
     row = db.get_document(document_id)
     if row is None:
         raise HTTPException(status_code=404, detail="document not found")
     return dict(row)
+
+
+@app.post("/api/documents/{document_id}/retry")
+def retry_document(document_id: str) -> dict[str, Any]:
+    row = db.get_document(document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    requeued = db.requeue_unsuccessful_document(document_id)
+    refreshed = db.get_document(document_id)
+    if requeued:
+        db.record_event("retry", f"Requeued failed document: {row['rel_path']}", document_id, row["rel_path"])
+    return {
+        "requeued": requeued,
+        "document": dict(refreshed) if refreshed else None,
+    }
 
 
 @app.get("/api/documents/{document_id}/text")
@@ -307,7 +341,8 @@ def ensure_allowed(path: Path, allow_state: bool = False) -> None:
 
 
 def pdf_preview_path(row) -> Path:
-    candidate = row["searchable_pdf"] or (row["path"] if row["ext"] == ".pdf" else None)
+    ext = row["ext"]
+    candidate = row["path"] if ext == ".pdf" else row["searchable_pdf"] if ext == ".caj" else None
     if not candidate:
         raise HTTPException(status_code=404, detail="pdf preview not available")
     path = Path(candidate)

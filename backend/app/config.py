@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         "__pycache__,.pytest_cache,.venv,venv"
     )
     exclude_paths: str = "README.md,.env,.env.example,docker-compose.yml,docs/design"
-    supported_extensions: str = ".pdf,.txt,.md,.doc,.docx,.caj"
+    supported_extensions: str = ".pdf,.txt,.md,.doc,.docx,.epub,.caj"
     pdf_text_only_paths: str = "pdf/论文"
     caj_converter_command: str = "caj2pdf convert {input} -o {output}"
     caj_converter_timeout_seconds: int = 600

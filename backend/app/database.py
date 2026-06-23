@@ -242,7 +242,7 @@ class Database:
             con.execute(
                 """
                 SELECT id FROM documents
-                WHERE deleted = 0 AND ext IN ('.txt', '.md', '.doc', '.docx')
+                WHERE deleted = 0 AND ext IN ('.txt', '.md', '.doc', '.docx', '.epub')
                 """
             )
         )
@@ -569,6 +569,74 @@ class Database:
                 (ts, document_id),
             )
             return True
+
+    def list_unsuccessful_documents(self, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as con:
+            return list(
+                con.execute(
+                    """
+                    SELECT * FROM documents
+                    WHERE deleted = 0 AND status IN ('error', 'empty')
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+
+    def unsuccessful_document_count(self) -> int:
+        with self.connect() as con:
+            row = con.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM documents
+                WHERE deleted = 0 AND status IN ('error', 'empty')
+                """
+            ).fetchone()
+            return int(row["count"] or 0) if row else 0
+
+    def requeue_unsuccessful_documents(self, limit: int = 1000) -> int:
+        ts = now_iso()
+        requeued = 0
+        with self._lock, self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT id FROM documents
+                    WHERE deleted = 0 AND status IN ('error', 'empty')
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+            for row in rows:
+                existing = con.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE document_id = ? AND type = 'index' AND status IN ('queued', 'processing')
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO jobs(document_id, type, status, priority, message, created_at, updated_at)
+                    VALUES(?, 'index', 'queued', 90, 'Retry failed document', ?, ?)
+                    """,
+                    (row["id"], ts, ts),
+                )
+                con.execute(
+                    """
+                    UPDATE documents
+                    SET status = 'queued', error = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (ts, row["id"]),
+                )
+                requeued += 1
+        return requeued
 
     def cancel_job(self, job_id: int, reason: str = "Cancelled by user") -> dict[str, Any] | None:
         ts = now_iso()

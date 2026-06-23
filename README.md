@@ -1,6 +1,6 @@
 # 本地资料检索
 
-本项目是一个 Docker 化的本地资料 OCR、索引与全文检索系统。把 PDF、CAJ、TXT、MD、DOC、DOCX 放进 `data/` 目录后，系统会自动扫描、处理、建立 SQLite/FTS 全文索引，并在网页端提供搜索、按文件聚合结果、PDF 命中页预览、高亮、引用导出和本地文件打开。
+本项目是一个 Docker 化的本地资料 OCR、索引与全文检索系统。把 PDF、CAJ、TXT、MD、DOC、DOCX、EPUB 放进 `data/` 目录后，系统会自动扫描、处理、建立 SQLite/FTS 全文索引，并在网页端提供搜索、按文件聚合结果、PDF 命中页预览、高亮、引用导出和本地文件打开。
 
 网页入口：
 
@@ -38,13 +38,13 @@ http://localhost:8000
 ## 功能概览
 
 - 自动扫描 `data/` 及子目录。
-- 支持 `.pdf`、`.caj`、`.txt`、`.md`、`.doc`、`.docx`。
+- 支持 `.pdf`、`.caj`、`.txt`、`.md`、`.doc`、`.docx`、`.epub`。
 - PDF 默认调用 PaddleOCR 官方 API，模型默认为 `PP-OCRv6`。
 - PDF OCR 后会在原 PDF 页面上追加不可见文字层，并写回原路径。
 - `data/pdf/论文/` 下的 PDF 默认只读取内嵌文字，不重新 OCR。
 - CAJ 会先转成可搜索 PDF，再抽取文字；若转换后文字不足，会继续 OCR。
 - DOC/DOCX 会抽取文字，并转换 PDF 用于预览。
-- TXT/MD 直接抽取文本并入库。
+- TXT/MD/EPUB 直接抽取文本并入库。
 - 搜索索引会写入简体/繁体变体，简繁关键词都能检索。
 - 搜索结果按文件聚合，展开后显示文件内命中条目。
 - 支持普通搜索、同一行多关键词搜索、同一文件多关键词搜索。
@@ -196,7 +196,7 @@ data/
 - `venv`
 - `EXCLUDE_DIRS`、`EXCLUDE_PATHS` 配置中排除的目录或路径
 
-当前 Docker 配置默认处理 `.pdf`、`.txt`、`.md`、`.doc`、`.docx`、`.caj`。
+当前 Docker 配置默认处理 `.pdf`、`.txt`、`.md`、`.doc`、`.docx`、`.epub`、`.caj`。
 
 ### 什么时候会重新处理文件
 
@@ -260,6 +260,10 @@ CAJ_CONVERTER_COMMAND=caj2pdf convert {input} -o {output}
 ### TXT / MD
 
 直接抽取纯文本，按行或文本块建立索引。
+
+### EPUB
+
+不调用 OCR。系统会读取 EPUB 内部的 OPF 目录和 spine 顺序，抽取 XHTML/HTML 章节正文并建立全文索引。搜索命中后右侧展示文本上下文；如需查看原书，可点击“打开”调用本机默认 EPUB 阅读器。
 
 ### DOC / DOCX
 

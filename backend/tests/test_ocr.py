@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import fitz
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -245,6 +246,49 @@ class OcrCoordinateTests(unittest.TestCase):
             pages = engine.recognize_pdf(source)
 
             self.assertEqual([2, 1], fake_client.batch_page_counts)
+            self.assertEqual([1, 2, 3], [page.page_number for page in pages])
+
+    def test_api_engine_splits_failed_transport_batches(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.batch_page_counts: list[int] = []
+
+            def ocr_pdf(self, source_pdf: Path, progress_callback=None, cancel_callback=None):
+                with fitz.open(source_pdf) as doc:
+                    page_count = doc.page_count
+                self.batch_page_counts.append(page_count)
+                if page_count > 1:
+                    raise httpx.RemoteProtocolError("server disconnected")
+                return [
+                    OcrPageResult(
+                        page_number=1,
+                        image_width=200,
+                        image_height=100,
+                        lines=[],
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            with fitz.open() as doc:
+                for _ in range(3):
+                    doc.new_page(width=200, height=100)
+                doc.save(source)
+
+            engine = PaddleOcrEngine(
+                SimpleNamespace(
+                    paddleocr_api_token="token",
+                    paddleocr_api_batch_pages=10,
+                    temp_dir=root,
+                )
+            )
+            fake_client = FakeClient()
+            engine._client = fake_client  # type: ignore[assignment]
+
+            pages = engine.recognize_pdf(source)
+
+            self.assertEqual([3, 1, 2, 1, 1], fake_client.batch_page_counts)
             self.assertEqual([1, 2, 3], [page.page_number for page in pages])
 
 

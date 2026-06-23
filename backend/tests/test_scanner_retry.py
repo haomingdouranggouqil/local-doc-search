@@ -14,6 +14,67 @@ from app.scanner import DocumentScanner
 
 
 class ScannerRetryTests(unittest.TestCase):
+    def test_failed_documents_can_be_listed_and_requeued_individually(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            db.upsert_document(
+                {
+                    "id": "doc1",
+                    "path": str(root / "failed.doc"),
+                    "rel_path": "doc/failed.doc",
+                    "title": "failed.doc",
+                    "ext": ".doc",
+                    "size": 1,
+                    "mtime": 1.0,
+                    "sha256": "hash",
+                    "status": "queued",
+                }
+            )
+            db.fail_document("doc1", "temporary failure")
+
+            failed = db.list_unsuccessful_documents()
+
+            self.assertEqual(1, db.unsuccessful_document_count())
+            self.assertEqual(1, len(failed))
+            self.assertEqual("doc1", failed[0]["id"])
+            self.assertEqual("temporary failure", failed[0]["error"])
+
+            self.assertTrue(db.requeue_unsuccessful_document("doc1"))
+
+            self.assertEqual(0, db.unsuccessful_document_count())
+            stats = db.stats()
+            self.assertEqual(1, stats["jobs"]["queued"])
+            doc = db.get_document("doc1")
+            self.assertEqual("queued", doc["status"])
+            self.assertIsNone(doc["error"])
+
+    def test_failed_documents_can_be_requeued_in_bulk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "index.sqlite")
+            for index in range(2):
+                document_id = f"doc{index}"
+                db.upsert_document(
+                    {
+                        "id": document_id,
+                        "path": str(root / f"failed-{index}.doc"),
+                        "rel_path": f"doc/failed-{index}.doc",
+                        "title": f"failed-{index}.doc",
+                        "ext": ".doc",
+                        "size": 1,
+                        "mtime": float(index + 1),
+                        "sha256": "hash",
+                        "status": "queued",
+                    }
+                )
+                db.fail_document(document_id, "temporary failure")
+
+            self.assertEqual(2, db.requeue_unsuccessful_documents())
+
+            self.assertEqual(0, db.unsuccessful_document_count())
+            self.assertEqual(2, db.stats()["jobs"]["queued"])
+
     def test_scan_can_requeue_failed_unchanged_documents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import posixpath
 import shlex
+import shutil
 import subprocess
+import tempfile
+import zipfile
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote
+from xml.etree import ElementTree as ET
 
 import fitz
 from charset_normalizer import from_bytes
@@ -50,6 +57,199 @@ def extract_plain_text(path: Path) -> ExtractedText:
     return chunks_from_lines(text.splitlines(), source="text")
 
 
+def extract_epub(path: Path) -> ExtractedText:
+    lines: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        rootfile_path = _epub_rootfile_path(archive)
+        opf_root = ET.fromstring(archive.read(rootfile_path))
+        manifest, spine_ids = _epub_manifest_and_spine(opf_root, rootfile_path)
+        html_paths = _epub_ordered_html_paths(manifest, spine_ids)
+
+        for item_path in html_paths:
+            try:
+                raw = archive.read(item_path)
+            except KeyError:
+                continue
+            lines.extend(_html_text_lines(raw))
+
+    return chunks_from_lines(lines, source="epub")
+
+
+def _epub_rootfile_path(archive: zipfile.ZipFile) -> str:
+    try:
+        container = ET.fromstring(archive.read("META-INF/container.xml"))
+        for elem in container.iter():
+            if _xml_local_name(elem.tag) == "rootfile":
+                full_path = elem.attrib.get("full-path", "").strip()
+                if full_path:
+                    return full_path
+    except (KeyError, ET.ParseError):
+        pass
+
+    for name in archive.namelist():
+        if name.lower().endswith(".opf"):
+            return name
+    raise ValueError("EPUB package file was not found")
+
+
+def _epub_manifest_and_spine(
+    opf_root: ET.Element,
+    rootfile_path: str,
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    base_dir = posixpath.dirname(rootfile_path)
+    manifest: dict[str, dict[str, str]] = {}
+    spine_ids: list[str] = []
+
+    for elem in opf_root.iter():
+        local_name = _xml_local_name(elem.tag)
+        if local_name == "item":
+            item_id = elem.attrib.get("id", "").strip()
+            href = elem.attrib.get("href", "").strip()
+            if not item_id or not href:
+                continue
+            manifest[item_id] = {
+                "href": _epub_join(base_dir, href),
+                "media_type": elem.attrib.get("media-type", "").strip().lower(),
+            }
+        elif local_name == "itemref":
+            idref = elem.attrib.get("idref", "").strip()
+            if idref:
+                spine_ids.append(idref)
+    return manifest, spine_ids
+
+
+def _epub_ordered_html_paths(
+    manifest: dict[str, dict[str, str]],
+    spine_ids: list[str],
+) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    for item_id in spine_ids:
+        item = manifest.get(item_id)
+        if item and _epub_manifest_item_is_html(item):
+            href = item["href"]
+            if href not in seen:
+                ordered.append(href)
+                seen.add(href)
+
+    if ordered:
+        return ordered
+
+    for item in manifest.values():
+        if _epub_manifest_item_is_html(item):
+            href = item["href"]
+            if href not in seen:
+                ordered.append(href)
+                seen.add(href)
+    return ordered
+
+
+def _epub_manifest_item_is_html(item: dict[str, str]) -> bool:
+    media_type = item.get("media_type", "")
+    href = item.get("href", "").lower()
+    return (
+        media_type in {"application/xhtml+xml", "text/html"}
+        or href.endswith(".xhtml")
+        or href.endswith(".html")
+        or href.endswith(".htm")
+    )
+
+
+def _epub_join(base_dir: str, href: str) -> str:
+    path = posixpath.normpath(posixpath.join(base_dir, unquote(href.split("#", 1)[0])))
+    if path.startswith("../") or path == ".." or path.startswith("/"):
+        raise ValueError(f"Unsafe EPUB item path: {href}")
+    return path
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _html_text_lines(raw: bytes) -> list[str]:
+    parser = _HtmlTextParser()
+    parser.feed(decode_text_bytes(raw))
+    parser.close()
+    return parser.text().splitlines()
+
+
+class _HtmlTextParser(HTMLParser):
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "body",
+        "br",
+        "caption",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    SKIP_TAGS = {"script", "style", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or not data:
+            return
+        self._parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    def _append_break(self) -> None:
+        if self._parts and self._parts[-1] != "\n":
+            self._parts.append("\n")
+
+
 def decode_text_bytes(raw: bytes) -> str:
     if not raw:
         return ""
@@ -85,17 +285,28 @@ def text_decode_score(text: str) -> float:
 
 
 def extract_docx(path: Path) -> ExtractedText:
-    doc = DocxDocument(path)
-    lines: list[str] = []
-    for paragraph in doc.paragraphs:
-        if paragraph.text.strip():
-            lines.append(paragraph.text)
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if cells:
-                lines.append(" | ".join(cells))
-    return chunks_from_lines(lines, source="docx")
+    strict_error: Exception | None = None
+    try:
+        doc = DocxDocument(path)
+        lines: list[str] = []
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                lines.append(paragraph.text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    lines.append(" | ".join(cells))
+        return chunks_from_lines(lines, source="docx")
+    except Exception as exc:
+        strict_error = exc
+
+    extracted = extract_office_text(path, source="docx")
+    if extracted.has_text_layer:
+        return extracted
+    if strict_error is not None:
+        raise strict_error
+    return extracted
 
 
 def extract_doc(path: Path) -> ExtractedText:
@@ -117,12 +328,22 @@ def extract_doc(path: Path) -> ExtractedText:
                 return chunks_from_lines(result.stdout.splitlines(), source="doc")
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             continue
-    return ExtractedText(
-        chunks=[],
-        page_count=0,
-        text_chars=0,
-        has_text_layer=False,
-    )
+    return extract_office_text(path, source="doc")
+
+
+def extract_office_text(path: Path, source: str) -> ExtractedText:
+    with tempfile.TemporaryDirectory(prefix="docsearch-office-text-") as temp:
+        converted = _convert_office_document(
+            path,
+            Path(temp),
+            convert_to="txt:Text",
+            output_suffix=".txt",
+            timeout=180,
+        )
+        if converted is None:
+            return ExtractedText(chunks=[], page_count=0, text_chars=0, has_text_layer=False)
+        text = decode_text_bytes(converted.read_bytes())
+    return chunks_from_lines(text.splitlines(), source=source)
 
 
 def chunks_from_lines(lines: Iterable[str], source: str) -> ExtractedText:
@@ -151,27 +372,60 @@ def chunks_from_lines(lines: Iterable[str], source: str) -> ExtractedText:
 
 
 def convert_office_to_pdf(path: Path, output_dir: Path) -> Path | None:
+    return _convert_office_document(
+        path,
+        output_dir,
+        convert_to="pdf",
+        output_suffix=".pdf",
+        timeout=180,
+    )
+
+
+def _convert_office_document(
+    path: Path,
+    output_dir: Path,
+    *,
+    convert_to: str,
+    output_suffix: str,
+    timeout: int,
+) -> Path | None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / f"{path.stem}{output_suffix}"
+    target.unlink(missing_ok=True)
+    source_suffix = path.suffix if path.suffix else ".bin"
     try:
-        subprocess.run(
-            [
-                "soffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                str(output_dir),
-                str(path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        with tempfile.TemporaryDirectory(prefix="docsearch-office-source-") as temp:
+            temp_dir = Path(temp)
+            safe_source = temp_dir / f"source{source_suffix}"
+            temp_output_dir = temp_dir / "out"
+            temp_output_dir.mkdir()
+            shutil.copyfile(path, safe_source)
+            subprocess.run(
+                [
+                    "soffice",
+                    "--headless",
+                    "--convert-to",
+                    convert_to,
+                    "--outdir",
+                    str(temp_output_dir),
+                    str(safe_source),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            converted = temp_output_dir / f"{safe_source.stem}{output_suffix}"
+            if not converted.exists():
+                matches = list(temp_output_dir.glob(f"*{output_suffix}"))
+                if not matches:
+                    return None
+                converted = matches[0]
+            shutil.copyfile(converted, target)
+            return target
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        target.unlink(missing_ok=True)
         return None
-    candidate = output_dir / f"{path.stem}.pdf"
-    return candidate if candidate.exists() else None
 
 
 class CajConversionError(RuntimeError):

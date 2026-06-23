@@ -52,9 +52,9 @@ input {
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 16px;
   padding: 22px 18px;
-  overflow: hidden;
+  overflow-y: auto;
   background: #fbfcfd;
   border-right: 1px solid var(--border);
 }
@@ -273,6 +273,7 @@ input {
 }
 
 .queue,
+.failed-documents,
 .events {
   min-height: 0;
 }
@@ -280,6 +281,12 @@ input {
 .queue {
   flex: 0 0 auto;
   max-height: min(38vh, 300px);
+  overflow: hidden;
+}
+
+.failed-documents {
+  flex: 0 0 auto;
+  max-height: min(32vh, 260px);
   overflow: hidden;
 }
 
@@ -295,6 +302,103 @@ input {
   z-index: 1;
   padding-bottom: 2px;
   background: #fbfcfd;
+}
+
+.failed-title {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.failed-title > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.failed-title button,
+.failed-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 28px;
+  color: var(--danger);
+  background: #fff;
+  border: 1px solid #efcaca;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.failed-title button {
+  padding: 0 8px;
+}
+
+.failed-row button {
+  padding: 0 7px;
+}
+
+.failed-title button:hover:not(:disabled),
+.failed-row button:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: #fff7f7;
+}
+
+.failed-title button:disabled,
+.failed-row button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.failed-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(24vh, 212px);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.failed-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px;
+  background: #fffafa;
+  border: 1px solid #f0d0d0;
+  border-radius: 8px;
+}
+
+.failed-row-main {
+  min-width: 0;
+}
+
+.failed-row-main b,
+.failed-row-main span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failed-row-main b {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.failed-row-main span,
+.failed-more {
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.failed-more {
+  padding: 3px 2px 0;
 }
 
 .active-job {
@@ -536,6 +640,59 @@ input {
   min-height: 0;
   padding-bottom: 22px;
   overflow: auto;
+}
+
+.search-progress {
+  display: grid;
+  min-height: min(320px, 45vh);
+  place-items: center;
+  gap: 10px;
+  padding: 36px 18px;
+  color: #576472;
+  text-align: center;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.search-progress strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.search-progress span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.search-progress-track {
+  width: min(320px, 72%);
+  height: 6px;
+  overflow: hidden;
+  background: #eef3f5;
+  border-radius: 999px;
+}
+
+.search-progress-track span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  animation: search-progress-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes search-progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  50% {
+    transform: translateX(85%);
+  }
+  100% {
+    transform: translateX(240%);
+  }
 }
 
 .result-row {
@@ -962,8 +1119,15 @@ mark {
   }
 
   .queue,
+  .failed-documents,
   .events {
     flex: none;
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .failed-list {
     max-height: none;
     overflow: visible;
     padding-right: 0;

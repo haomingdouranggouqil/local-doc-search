@@ -38,6 +38,8 @@ function App() {
   const [selected, setSelected] = useState(null);
   const [stats, setStats] = useState(null);
   const [jobs, setJobs] = useState([]);
+  const [failedDocuments, setFailedDocuments] = useState([]);
+  const [failedTotal, setFailedTotal] = useState(0);
   const [events, setEvents] = useState([]);
   const [categories, setCategories] = useState([{ path: '', label: '全部资料' }]);
   const [scope, setScope] = useState('');
@@ -49,6 +51,7 @@ function App() {
   const [scanLoading, setScanLoading] = useState(false);
   const [retryFailedOnScan, setRetryFailedOnScan] = useState(false);
   const [jobAction, setJobAction] = useState({ id: null, type: '' });
+  const [failedAction, setFailedAction] = useState({ id: null, type: '' });
   const [tokenForm, setTokenForm] = useState({ paddleocr_api_token: '', deepseek_api_key: '' });
   const [tokenSaveState, setTokenSaveState] = useState({ saving: false, error: '', saved: false });
   const [openStatus, setOpenStatus] = useState(null);
@@ -107,14 +110,17 @@ function App() {
   }, [selected?.document_id]);
 
   async function refreshStatus() {
-    const [statsData, jobsData, eventsData, categoriesData] = await Promise.all([
+    const [statsData, jobsData, failedData, eventsData, categoriesData] = await Promise.all([
       getJson(`${API}/stats`).catch(() => null),
       getJson(`${API}/jobs`).catch(() => ({ jobs: [] })),
+      getJson(`${API}/failed-documents?limit=12`).catch(() => ({ documents: [], total: 0 })),
       getJson(`${API}/events`).catch(() => ({ events: [] })),
       getJson(`${API}/categories`).catch(() => ({ categories: [{ path: '', label: '全部资料' }] })),
     ]);
     if (statsData) setStats(statsData);
     setJobs(jobsData.jobs || []);
+    setFailedDocuments(failedData.documents || []);
+    setFailedTotal(Number(failedData.total || 0));
     setEvents(eventsData.events || []);
     setCategories(categoriesData.categories || [{ path: '', label: '全部资料' }]);
   }
@@ -137,6 +143,28 @@ function App() {
       await refreshStatus();
     } finally {
       setJobAction({ id: null, type: '' });
+    }
+  }
+
+  async function retryFailedDocument(document) {
+    if (!document?.id || failedAction.id) return;
+    setFailedAction({ id: document.id, type: 'single' });
+    try {
+      await postJson(`${API}/documents/${encodeURIComponent(document.id)}/retry`);
+      await refreshStatus();
+    } finally {
+      setFailedAction({ id: null, type: '' });
+    }
+  }
+
+  async function retryAllFailedDocuments() {
+    if (failedAction.id || failedTotal <= 0) return;
+    setFailedAction({ id: 'all', type: 'all' });
+    try {
+      await postJson(`${API}/failed-documents/retry`);
+      await refreshStatus();
+    } finally {
+      setFailedAction({ id: null, type: '' });
     }
   }
 
@@ -253,19 +281,19 @@ function App() {
   const activeJob = stats?.latest_job;
   const selectedPdfUrl = useMemo(() => {
     if (!selected) return '';
-    const canUsePdf = selected.ext === '.pdf' || selected.searchable_pdf;
-    if (!canUsePdf) return '';
+    if (!hasPdfPreview(selected)) return '';
     const page = selected.page ? `#page=${selected.page}&search=${encodeURIComponent(query)}` : '';
     return `${API}/files/${selected.document_id}/pdf${page}`;
   }, [selected, query]);
   const selectedPdfPageImageUrl = useMemo(() => {
-    if (!selected || !(selected.ext === '.pdf' || selected.searchable_pdf) || !selected.page) return '';
+    if (!selected || !hasPdfPreview(selected) || !selected.page) return '';
     const params = new URLSearchParams({ page: String(selected.page) });
     if (selected.match_id) params.set('match_id', String(selected.match_id));
     if (query.trim()) params.set('q', query.trim());
     return `${API}/files/${selected.document_id}/page-image?${params.toString()}`;
   }, [selected, query]);
   const activeSearchMode = SEARCH_MODES.find((mode) => mode.value === searchMode) || SEARCH_MODES[0];
+  const showSearchProgress = Boolean(query.trim() && searching);
 
   return (
     <main className="app-shell">
@@ -308,6 +336,52 @@ function App() {
             <span>重试失败文件</span>
           </label>
         </div>
+
+        <section className="failed-documents">
+          <div className="section-title failed-title">
+            <span>
+              <AlertTriangle size={16} />
+              失败文件
+            </span>
+            {failedTotal > 0 && (
+              <button
+                type="button"
+                onClick={retryAllFailedDocuments}
+                disabled={Boolean(failedAction.id)}
+                title="将所有失败或空结果文件重新加入处理队列"
+              >
+                {failedAction.id === 'all' ? <Loader2 className="spin" size={13} /> : <RotateCcw size={13} />}
+                全部重试
+              </button>
+            )}
+          </div>
+          {failedDocuments.length ? (
+            <div className="failed-list">
+              {failedDocuments.map((document) => (
+                <div className="failed-row" key={document.id}>
+                  <div className="failed-row-main">
+                    <b title={document.rel_path}>{failedDocumentLabel(document)}</b>
+                    <span title={failedDocumentReason(document)}>{failedDocumentReason(document)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => retryFailedDocument(document)}
+                    disabled={Boolean(failedAction.id)}
+                    title="重新处理此文件"
+                  >
+                    {failedAction.id === document.id ? <Loader2 className="spin" size={13} /> : <RotateCcw size={13} />}
+                    重试
+                  </button>
+                </div>
+              ))}
+              {failedTotal > failedDocuments.length && (
+                <div className="failed-more">还有 {failedTotal - failedDocuments.length} 个失败文件未显示</div>
+              )}
+            </div>
+          ) : (
+            <p className="muted">暂无失败文件</p>
+          )}
+        </section>
 
         <section className="queue">
           <div className="section-title">
@@ -427,7 +501,8 @@ function App() {
         </div>
 
         <div className="results-list">
-          {resultGroups.map((group) => {
+          {showSearchProgress && <SearchProgress query={query} />}
+          {!showSearchProgress && resultGroups.map((group) => {
             const documentId = group.document_id;
             const expanded = Boolean(expandedDocuments[documentId]);
             const hitState = documentHits[documentId] || {
@@ -533,13 +608,13 @@ function App() {
               </React.Fragment>
             );
           })}
-          {query.trim() && !searching && resultGroups.length === 0 && (
+          {!showSearchProgress && query.trim() && !searching && resultGroups.length === 0 && (
             <div className="empty-state">
               <FileSearch size={24} />
               <span>没有命中结果</span>
             </div>
           )}
-          {query.trim() && hasMoreResults && (
+          {!showSearchProgress && query.trim() && hasMoreResults && (
             <button
               type="button"
               className="load-more-button"
@@ -665,6 +740,20 @@ function OcrDeviceMetric({ stats, tokenForm, tokenSaveState, onTokenChange, onSa
         </div>
       </div>
     </form>
+  );
+}
+
+function SearchProgress({ query }) {
+  const text = String(query || '').trim();
+  return (
+    <div className="search-progress" role="status" aria-live="polite">
+      <Loader2 className="spin" size={22} />
+      <strong>正在搜索</strong>
+      <span>{text ? `正在匹配“${text}”` : '正在准备搜索'}</span>
+      <div className="search-progress-track" aria-hidden="true">
+        <span />
+      </div>
+    </div>
   );
 }
 
@@ -824,6 +913,12 @@ function fileTypeLabel(ext) {
   return ext === '.pdf' ? 'PDF' : String(ext || '').replace('.', '').toUpperCase();
 }
 
+function hasPdfPreview(result) {
+  if (!result) return false;
+  if (result.ext === '.pdf') return true;
+  return result.ext === '.caj' && Boolean(result.searchable_pdf);
+}
+
 function resourceLimitLabel(stats) {
   const limits = stats?.resources?.limits;
   if (!limits) return '自动';
@@ -838,6 +933,15 @@ function jobLabel(job) {
 
 function jobTooltip(job) {
   return job.error || job.message || job.rel_path;
+}
+
+function failedDocumentLabel(document) {
+  return document.title || document.rel_path || document.id;
+}
+
+function failedDocumentReason(document) {
+  if (document.status === 'empty') return '未抽取到文字，可重试处理';
+  return document.error || '处理失败，可重试处理';
 }
 
 function ocrDeviceLabel(stats) {

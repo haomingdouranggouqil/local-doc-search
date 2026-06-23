@@ -13,15 +13,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     fonts-noto-cjk \
     fontconfig \
+    g++ \
     libglib2.0-0 \
+    libjbig2dec0-dev \
     libreoffice-writer \
     mupdf-tools \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "https://github.com/caj2pdf/caj2pdf/archive/${CAJ2PDF_REF}.tar.gz" -o /tmp/caj2pdf.tar.gz \
     && mkdir -p /opt/caj2pdf \
     && tar -xzf /tmp/caj2pdf.tar.gz -C /opt/caj2pdf --strip-components=1 \
-    && printf '#!/bin/sh\nexec python /opt/caj2pdf/caj2pdf "$@"\n' > /usr/local/bin/caj2pdf \
+    && cd /opt/caj2pdf/lib \
+    && g++ -Wall -fPIC --shared -o /opt/caj2pdf/libjbigdec.so jbigdec.cc JBigDecode.cc \
+    && g++ -Wall $(pkg-config --cflags jbig2dec) -fPIC -shared -o /opt/caj2pdf/libjbig2codec.so decode_jbig2data_x.cc $(pkg-config --libs jbig2dec) \
+    && printf '#!/bin/sh\ncd /opt/caj2pdf && exec python /opt/caj2pdf/caj2pdf "$@"\n' > /usr/local/bin/caj2pdf \
     && chmod +x /usr/local/bin/caj2pdf \
     && rm /tmp/caj2pdf.tar.gz
 

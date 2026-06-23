@@ -13,9 +13,9 @@ from .resources import ResourcePolicy
 from .text_extractors import (
     ExtractedText,
     convert_caj_to_pdf,
-    convert_office_to_pdf,
     extract_doc,
     extract_docx,
+    extract_epub,
     extract_pdf_text,
     extract_plain_text,
 )
@@ -154,15 +154,14 @@ class DocumentIndexer:
         if ext in {".txt", ".md"}:
             return extract_plain_text(path), None
 
+        if ext == ".epub":
+            return extract_epub(path), None
+
         if ext == ".docx":
-            extracted = extract_docx(path)
-            pdf = convert_office_to_pdf(path, self.settings.preview_dir / document_id)
-            return extracted, pdf
+            return extract_docx(path), None
 
         if ext == ".doc":
-            extracted = extract_doc(path)
-            pdf = convert_office_to_pdf(path, self.settings.preview_dir / document_id)
-            return extracted, pdf
+            return extract_doc(path), None
 
         return ExtractedText(chunks=[], text_chars=0), None
 

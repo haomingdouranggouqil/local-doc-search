@@ -81,9 +81,13 @@ class PaddleOcrEngine:
                     page_count = doc.page_count
             except Exception:
                     page_count = 0
-            if page_count > batch_pages:
+            if page_count > 1:
                 return self._recognize_pdf_in_batches(
-                    source_pdf, page_count, batch_pages, progress_callback, cancel_callback
+                    source_pdf,
+                    page_count,
+                    min(batch_pages, page_count),
+                    progress_callback,
+                    cancel_callback,
                 )
         return self._client.ocr_pdf(source_pdf, progress_callback, cancel_callback)
 
@@ -103,38 +107,93 @@ class PaddleOcrEngine:
                 if cancel_callback:
                     cancel_callback()
                 end = min(page_count, start + batch_pages)
-                chunk_pdf = temp_dir / (
-                    f"{source_pdf.stem}.{uuid.uuid4().hex}.pages-{start + 1}-{end}.pdf"
+                pages.extend(
+                    self._recognize_pdf_page_range(
+                        doc,
+                        source_pdf,
+                        temp_dir,
+                        page_count,
+                        start,
+                        end,
+                        progress_callback,
+                        cancel_callback,
+                    )
                 )
-                with fitz.open() as chunk:
-                    chunk.insert_pdf(doc, from_page=start, to_page=end - 1)
-                    chunk.save(chunk_pdf, garbage=4, deflate=True)
-                try:
-                    if progress_callback:
-                        progress_callback(
-                            start,
-                            page_count,
-                            f"Uploading PDF pages {start + 1}-{end} to PaddleOCR API",
-                        )
-
-                    def chunk_progress(done: float, _total: int, message: str) -> None:
-                        if cancel_callback:
-                            cancel_callback()
-                        if not progress_callback:
-                            return
-                        bounded_done = max(0.0, min(float(done or 0), float(end - start)))
-                        progress_callback(
-                            start + bounded_done,
-                            page_count,
-                            f"{message} pages {start + 1}-{end}",
-                        )
-
-                    for page in self._client.ocr_pdf(chunk_pdf, chunk_progress, cancel_callback):
-                        page.page_number = start + max(1, int(page.page_number or 1))
-                        pages.append(page)
-                finally:
-                    chunk_pdf.unlink(missing_ok=True)
         return sorted(pages, key=lambda page: page.page_number)
+
+    def _recognize_pdf_page_range(
+        self,
+        source_doc: fitz.Document,
+        source_pdf: Path,
+        temp_dir: Path,
+        page_count: int,
+        start: int,
+        end: int,
+        progress_callback: ProgressCallback | None,
+        cancel_callback: CancellationCallback | None,
+    ) -> list[OcrPageResult]:
+        chunk_pdf = temp_dir / (
+            f"{source_pdf.stem}.{uuid.uuid4().hex}.pages-{start + 1}-{end}.pdf"
+        )
+        with fitz.open() as chunk:
+            chunk.insert_pdf(source_doc, from_page=start, to_page=end - 1)
+            chunk.save(chunk_pdf, garbage=4, deflate=True)
+        try:
+            if progress_callback:
+                progress_callback(
+                    start,
+                    page_count,
+                    f"Uploading PDF pages {start + 1}-{end} to PaddleOCR API",
+                )
+
+            def chunk_progress(done: float, _total: int, message: str) -> None:
+                if cancel_callback:
+                    cancel_callback()
+                if not progress_callback:
+                    return
+                bounded_done = max(0.0, min(float(done or 0), float(end - start)))
+                progress_callback(
+                    start + bounded_done,
+                    page_count,
+                    f"{message} pages {start + 1}-{end}",
+                )
+
+            pages = []
+            for page in self._client.ocr_pdf(chunk_pdf, chunk_progress, cancel_callback):
+                page.page_number = start + max(1, int(page.page_number or 1))
+                pages.append(page)
+            return pages
+        except httpx.TransportError:
+            if end - start <= 1:
+                raise
+            middle = start + max(1, (end - start) // 2)
+            if progress_callback:
+                progress_callback(
+                    start,
+                    page_count,
+                    f"Retrying PDF pages {start + 1}-{end} in smaller OCR batches",
+                )
+            return self._recognize_pdf_page_range(
+                source_doc,
+                source_pdf,
+                temp_dir,
+                page_count,
+                start,
+                middle,
+                progress_callback,
+                cancel_callback,
+            ) + self._recognize_pdf_page_range(
+                source_doc,
+                source_pdf,
+                temp_dir,
+                page_count,
+                middle,
+                end,
+                progress_callback,
+                cancel_callback,
+            )
+        finally:
+            chunk_pdf.unlink(missing_ok=True)
 
 
 class PaddleOcrApiClient:
