@@ -48,6 +48,7 @@ http://localhost:8000
 - 搜索索引会写入简体/繁体变体，简繁关键词都能检索。
 - 搜索结果按文件聚合，展开后显示文件内命中条目。
 - 支持普通搜索、同一行多关键词搜索、同一文件多关键词搜索。
+- 支持模糊搜索：使用 SiliconFlow 的 `Qwen/Qwen3-Embedding-8B` API 将每行文本向量化为 512 维，写入 FAISS 4 bit 量化索引。
 - PDF 命中结果右侧显示对应页图片，并高亮命中位置。
 - 可按目录限制搜索范围，例如只搜 `pdf/论文`。
 - PDF 处理后可调用 DeepSeek 从前后页提取出版信息，并生成引用。
@@ -93,9 +94,10 @@ Copy-Item .env.example .env
 
 ```env
 PADDLEOCR_API_TOKEN=
+SILICONFLOW_API_KEY=
 ```
 
-也可以先不填 token 直接启动。首次打开网页时，如果 `PADDLEOCR_API_TOKEN` 或 `DEEPSEEK_API_KEY` 未配置，左侧 `OCR 设备` 卡片会显示输入框；保存后配置会写入 `.docsearch/runtime-config.json`，后端和 worker 会在后续任务中直接使用。
+也可以先不填 token 直接启动。首次打开网页时，如果 `PADDLEOCR_API_TOKEN` 或 `DEEPSEEK_API_KEY` 未配置，左侧 `OCR 设备` 卡片会显示输入框；如果 `SILICONFLOW_API_KEY` 未配置，左侧 `模糊索引` 区域会显示输入框。保存后配置会写入 `.docsearch/runtime-config.json`，后端和 worker 会在后续任务中直接使用。
 
 3. 把资料放进 `data/`，例如：
 
@@ -119,7 +121,8 @@ PowerShell -ExecutionPolicy Bypass -File .\scripts\start.ps1
 - 创建 `data/` 和 `.docsearch/`。
 - 启动本机文件打开助手 `127.0.0.1:8765`。
 - 等待 Docker 可用。
-- 执行 `docker compose up -d --build`。
+- 启动 Docker Compose 服务；模糊搜索向量化固定调用 SiliconFlow API，不再加载本机 embedding 模型。
+- 执行 Docker Compose 构建和启动。
 
 5. 打开网页：
 
@@ -305,11 +308,12 @@ CAJ_CONVERTER_COMMAND=caj2pdf convert {input} -o {output}
 
 ### 匹配模式
 
-搜索框下方有三个模式：
+搜索框下方有四个模式：
 
 - `普通`：默认模式。按输入内容搜索，适合单关键词或短语。
 - `同一行`：多个关键词必须同时出现在同一个 OCR 行或同一个文本 chunk。
 - `同一文件`：多个关键词可以出现在同一个文件的不同位置，只要同一个文件包含所有关键词即可。
+- `模糊`：使用 SiliconFlow embedding + FAISS 向量相似度查询，适合记不准原文措辞或想找语义相近内容。
 
 例子：
 
@@ -329,6 +333,20 @@ pdf/论文
 ```
 
 则只搜索 `data/pdf/论文/` 下面的文件。
+
+### 模糊搜索
+
+模糊搜索固定使用 SiliconFlow API 的 `Qwen/Qwen3-Embedding-8B`。构建索引和用户输入查询都会调用同一个模型；项目不再下载或加载本机 Hugging Face embedding 模型，也不再使用临时 Cloudflare embedding API。
+
+向量化逻辑：
+
+1. 按当前已抽取的文本 chunk/行逐条编码，不重新 OCR。
+2. 调用 SiliconFlow `/v1/embeddings`，请求 `dimensions=512`、`encoding_format=float`、`truncate=right`。
+3. 对返回的 512 维向量做 L2 normalize。
+4. 写入 SQLite 的 `chunk_embeddings` 表，并重建 `.docsearch/vector/chunks.faiss`。
+5. FAISS 默认使用 `IndexScalarQuantizer(..., QT_4bit, METRIC_INNER_PRODUCT)` 进行 4 bit 量化。
+
+前端左侧会显示“模糊索引”进度，例如 `120/697`。点击“更新模糊索引”会把尚未向量化的文件加入队列；处理过程中会在“处理队列”里显示当前文件的向量化进度。如果未配置 `SILICONFLOW_API_KEY`，前端会先显示输入框并禁用构建按钮。
 
 ## 前端界面说明
 
@@ -447,6 +465,35 @@ PUBLICATION_EXTRACT_ENABLED=true
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\scripts\set-deepseek-key.ps1
 ```
+
+### 模糊搜索配置
+
+```env
+SILICONFLOW_API_KEY=
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_TIMEOUT_SECONDS=60
+SILICONFLOW_RETRIES=3
+SILICONFLOW_EMBEDDING_BATCH_SIZE=0
+SILICONFLOW_EMBEDDING_CONCURRENCY=120
+SILICONFLOW_REQUESTS_PER_SECOND=30
+SILICONFLOW_TOKENS_PER_MINUTE=1000000
+SILICONFLOW_MAX_REQUEST_TOKENS=30000
+EMBEDDING_DIMENSION=512
+VECTOR_INDEX_ENABLED=true
+VECTOR_SEARCH_CANDIDATES=5000
+```
+
+说明：
+
+- `SILICONFLOW_API_KEY`：SiliconFlow API Key。未填写时，前端会在“模糊索引”区域提示填写。
+- 模型固定为 `Qwen/Qwen3-Embedding-8B`，前端和配置文件不提供其它模型选择。
+- `SILICONFLOW_EMBEDDING_BATCH_SIZE`：每次 API 请求最多提交的文本行数；默认 `0` 表示不按行数封顶，尽量把每个请求装到接近 `SILICONFLOW_MAX_REQUEST_TOKENS`。
+- `SILICONFLOW_EMBEDDING_CONCURRENCY`：单个文件向量化时的并发请求数，默认 120，用来在请求尚未返回时继续发起后续请求。
+- `SILICONFLOW_REQUESTS_PER_SECOND`：SiliconFlow 请求频率上限，默认 30 次/秒；L0 的 2000 RPM 上限约等于 33.3 次/秒，默认值留有余量。
+- `SILICONFLOW_TOKENS_PER_MINUTE`：按估算 token 做每分钟限流，默认 1000000。
+- `SILICONFLOW_MAX_REQUEST_TOKENS`：单次请求估算 token 上限，默认 30000，低于 `Qwen/Qwen3-Embedding-8B` 的 32768 token 输入上限。
+- `EMBEDDING_DIMENSION=512`：请求 SiliconFlow 返回 512 维向量。
+- `VECTOR_SEARCH_CANDIDATES`：FAISS 查询候选数，越大越容易覆盖更多文件，但查询越慢。
 
 ### 本地打开文件
 

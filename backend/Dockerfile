@@ -1,8 +1,10 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_RETRIES=10
 
 ARG CAJ2PDF_REF=6c4bc32b15ce748d211f45d536f5d5511ef9f368
 
@@ -15,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     g++ \
     libglib2.0-0 \
+    libgomp1 \
     libjbig2dec0-dev \
     libreoffice-writer \
     mupdf-tools \
@@ -34,7 +37,7 @@ RUN curl -fsSL "https://github.com/caj2pdf/caj2pdf/archive/${CAJ2PDF_REF}.tar.gz
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r /app/requirements.txt
+    && python -m pip install --retries 10 --timeout 1000 -r /app/requirements.txt
 
 COPY app /app/app
 

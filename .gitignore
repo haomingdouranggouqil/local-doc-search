@@ -1,6 +1,7 @@
 # Local data and generated search state
 data/
 .docsearch/
+QZhou-Embedding-Zh/
 
 # Local secrets and machine-specific settings
 .env

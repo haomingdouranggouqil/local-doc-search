@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ def now_iso() -> str:
 
 
 class Database:
-    def __init__(self, path: Path, journal_mode: str = "DELETE"):
+    def __init__(self, path: Path, journal_mode: str = "WAL"):
         self.path = path
         self.journal_mode = normalize_journal_mode(journal_mode)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,18 +29,29 @@ class Database:
 
     @contextmanager
     def connect(self):
-        con = sqlite3.connect(self.path, timeout=30)
+        con = sqlite3.connect(self.path, timeout=120)
         con.row_factory = sqlite3.Row
-        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("PRAGMA busy_timeout=120000")
         con.execute("PRAGMA foreign_keys=ON")
         try:
             yield con
-            con.commit()
+            self._commit_with_retry(con)
         except Exception:
             con.rollback()
             raise
         finally:
             con.close()
+
+    def _commit_with_retry(self, con: sqlite3.Connection) -> None:
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            try:
+                con.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == max_attempts - 1:
+                    raise
+                time.sleep(min(5.0, 0.5 * (attempt + 1)))
 
     def init(self) -> None:
         with self._lock, self.connect() as con:
@@ -64,6 +76,7 @@ class Database:
                     has_text_layer INTEGER NOT NULL DEFAULT 0,
                     searchable_pdf TEXT,
                     page_count INTEGER NOT NULL DEFAULT 0,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
                     text_chars INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     publication_status TEXT NOT NULL DEFAULT 'pending',
@@ -88,6 +101,18 @@ class Database:
                     FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                    chunk_id INTEGER PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    vector BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     document_id TEXT NOT NULL,
@@ -108,6 +133,10 @@ class Database:
                     ON jobs(status, priority, created_at);
                 CREATE INDEX IF NOT EXISTS idx_chunks_document
                     ON chunks(document_id, page, ordinal);
+                CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_document
+                    ON chunk_embeddings(document_id);
+                CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model
+                    ON chunk_embeddings(model, dim);
                 CREATE INDEX IF NOT EXISTS idx_documents_deleted_status
                     ON documents(deleted, status);
 
@@ -179,14 +208,29 @@ class Database:
         if not self.journal_mode:
             return
         try:
-            con.execute(f"PRAGMA journal_mode={self.journal_mode}")
+            current = con.execute("PRAGMA journal_mode").fetchone()
+            current_mode = str(current[0] if current else "").upper()
+            if current_mode == self.journal_mode:
+                if self.journal_mode == "WAL":
+                    con.execute("PRAGMA synchronous=NORMAL")
+                    con.execute("PRAGMA wal_autocheckpoint=1000")
+                return
         except sqlite3.OperationalError:
-            if self.journal_mode == "DELETE":
-                return
+            pass
+        max_attempts = 12
+        for attempt in range(max_attempts):
             try:
-                con.execute("PRAGMA journal_mode=DELETE")
-            except sqlite3.OperationalError:
+                con.execute(f"PRAGMA journal_mode={self.journal_mode}")
+                if self.journal_mode == "WAL":
+                    con.execute("PRAGMA synchronous=NORMAL")
+                    con.execute("PRAGMA wal_autocheckpoint=1000")
                 return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == max_attempts - 1:
+                    if self.journal_mode == "DELETE":
+                        return
+                    raise
+                time.sleep(min(3.0, 0.5 * (attempt + 1)))
 
     def _fts_exists(self, con: sqlite3.Connection) -> bool:
         row = con.execute(
@@ -281,14 +325,32 @@ class Database:
             for row in con.execute("PRAGMA table_info(documents)").fetchall()
         }
         additions = {
+            "chunk_count": "INTEGER NOT NULL DEFAULT 0",
             "publication_status": "TEXT NOT NULL DEFAULT 'pending'",
             "publication_info": "TEXT",
             "citation": "TEXT",
             "publication_checked_at": "TEXT",
         }
+        needs_chunk_backfill = (
+            "chunk_count" not in existing
+            or self._meta_value(con, "document_chunk_count_version") != "1"
+        )
         for name, definition in additions.items():
             if name not in existing:
                 con.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+        if needs_chunk_backfill:
+            con.execute(
+                """
+                UPDATE documents
+                SET chunk_count = COALESCE(
+                    (SELECT COUNT(*) FROM chunks WHERE chunks.document_id = documents.id),
+                    0
+                )
+                """
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('document_chunk_count_version', '1')"
+            )
 
     def fts_tokenizer(self) -> str:
         with self.connect() as con:
@@ -508,7 +570,13 @@ class Database:
                 deleted += 1
             return deleted
 
-    def enqueue_job(self, document_id: str, job_type: str = "index", priority: int = 100) -> None:
+    def enqueue_job(
+        self,
+        document_id: str,
+        job_type: str = "index",
+        priority: int = 100,
+        message: str = "Queued",
+    ) -> None:
         ts = now_iso()
         with self._lock, self.connect() as con:
             existing = con.execute(
@@ -523,14 +591,15 @@ class Database:
             con.execute(
                 """
                 INSERT INTO jobs(document_id, type, status, priority, message, created_at, updated_at)
-                VALUES(?, ?, 'queued', ?, 'Queued', ?, ?)
+                VALUES(?, ?, 'queued', ?, ?, ?, ?)
                 """,
-                (document_id, job_type, priority, ts, ts),
+                (document_id, job_type, priority, message, ts, ts),
             )
-            con.execute(
-                "UPDATE documents SET status = 'queued', updated_at = ? WHERE id = ?",
-                (ts, document_id),
-            )
+            if job_type == "index":
+                con.execute(
+                    "UPDATE documents SET status = 'queued', updated_at = ? WHERE id = ?",
+                    (ts, document_id),
+                )
 
     def requeue_unsuccessful_document(self, document_id: str) -> bool:
         ts = now_iso()
@@ -672,7 +741,7 @@ class Database:
                     """,
                     (job["document_id"],),
                 ).fetchone()
-                if active is None:
+                if active is None and job["type"] == "index":
                     con.execute(
                         """
                         UPDATE documents
@@ -692,6 +761,95 @@ class Database:
                     (job_id,),
                 ).fetchone()
             )
+
+    def cancel_vector_jobs(self, reason: str = "Cancelled by user") -> int:
+        ts = now_iso()
+        with self._lock, self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            rows = list(
+                con.execute(
+                    """
+                    SELECT jobs.id
+                    FROM jobs
+                    JOIN documents ON documents.id = jobs.document_id
+                    WHERE jobs.type = 'vector'
+                      AND jobs.status IN ('queued', 'processing')
+                      AND documents.deleted = 0
+                    """
+                )
+            )
+            if not rows:
+                return 0
+            con.execute(
+                """
+                UPDATE jobs
+                SET status='cancelled', progress=1, message=?, error=?,
+                    updated_at=?, finished_at=COALESCE(finished_at, ?)
+                WHERE jobs.type = 'vector'
+                  AND status IN ('queued', 'processing')
+                  AND document_id IN (
+                      SELECT id FROM documents WHERE deleted = 0
+                  )
+                """,
+                (reason, reason, ts, ts),
+            )
+            return len(rows)
+
+    def pause_vector_jobs(self, reason: str = "Embedding API unavailable") -> int:
+        ts = now_iso()
+        message = "Waiting for embedding API to recover"
+        with self._lock, self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            rows = list(
+                con.execute(
+                    """
+                    SELECT jobs.id
+                    FROM jobs
+                    JOIN documents ON documents.id = jobs.document_id
+                    WHERE jobs.type = 'vector'
+                      AND jobs.status IN ('queued', 'processing')
+                      AND documents.deleted = 0
+                    """
+                )
+            )
+            if not rows:
+                return 0
+            con.execute(
+                """
+                UPDATE jobs
+                SET status='queued', progress=0, message=?, error=?,
+                    updated_at=?, started_at=NULL
+                WHERE type = 'vector'
+                  AND status IN ('queued', 'processing')
+                  AND document_id IN (
+                      SELECT id FROM documents WHERE deleted = 0
+                  )
+                """,
+                (message, reason, ts),
+            )
+            return len(rows)
+
+    def active_vector_job_count(self, exclude_job_id: int | None = None) -> int:
+        params: list[Any] = []
+        where = [
+            "jobs.type = 'vector'",
+            "jobs.status IN ('queued', 'processing')",
+            "documents.deleted = 0",
+        ]
+        if exclude_job_id is not None:
+            where.append("jobs.id != ?")
+            params.append(int(exclude_job_id))
+        with self.connect() as con:
+            row = con.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE {" AND ".join(where)}
+                """,
+                params,
+            ).fetchone()
+            return int(row["count"] or 0) if row else 0
 
     def restart_job(self, job_id: int) -> dict[str, Any] | None:
         ts = now_iso()
@@ -726,14 +884,15 @@ class Database:
                 """,
                 (job["document_id"], job["type"], job["priority"], ts, ts),
             )
-            con.execute(
-                """
-                UPDATE documents
-                SET status='queued', error=NULL, updated_at=?
-                WHERE id=?
-                """,
-                (ts, job["document_id"]),
-            )
+            if job["type"] == "index":
+                con.execute(
+                    """
+                    UPDATE documents
+                    SET status='queued', error=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (ts, job["document_id"]),
+                )
             return dict(
                 con.execute(
                     """
@@ -765,15 +924,16 @@ class Database:
                 """
                 UPDATE jobs
                 SET status='processing', progress=0.01, message='Processing',
-                    started_at=?, updated_at=?
+                    error=NULL, started_at=?, updated_at=?
                 WHERE id=?
                 """,
                 (ts, ts, job["id"]),
             )
-            con.execute(
-                "UPDATE documents SET status='processing', updated_at=? WHERE id=?",
-                (ts, job["document_id"]),
-            )
+            if job["type"] == "index":
+                con.execute(
+                    "UPDATE documents SET status='processing', updated_at=? WHERE id=?",
+                    (ts, job["document_id"]),
+                )
             return con.execute("SELECT * FROM jobs WHERE id = ?", (job["id"],)).fetchone()
 
     def requeue_interrupted_jobs(self) -> int:
@@ -783,7 +943,7 @@ class Database:
             rows = list(
                 con.execute(
                     """
-                    SELECT jobs.id, jobs.document_id
+                    SELECT jobs.id, jobs.document_id, jobs.type
                     FROM jobs
                     JOIN documents ON documents.id = jobs.document_id
                     WHERE jobs.status = 'processing' AND documents.deleted = 0
@@ -800,10 +960,11 @@ class Database:
                     """,
                     (ts, row["id"]),
                 )
-                con.execute(
-                    "UPDATE documents SET status='queued', updated_at=? WHERE id=?",
-                    (ts, row["document_id"]),
-            )
+                if row["type"] == "index":
+                    con.execute(
+                        "UPDATE documents SET status='queued', updated_at=? WHERE id=?",
+                        (ts, row["document_id"]),
+                    )
             return len(rows)
 
     def job_cancelled(self, job_id: int) -> bool:
@@ -895,6 +1056,7 @@ class Database:
                 "SELECT rel_path FROM documents WHERE id = ?", (document_id,)
             ).fetchone()
             rel_path = doc["rel_path"] if doc else ""
+            chunk_count = 0
             for chunk in chunks:
                 text = normalize_text(chunk["text"])
                 if not text:
@@ -925,10 +1087,11 @@ class Database:
                     """,
                     (chunk_id, indexed_text, chunk_id, document_id, rel_path, chunk.get("page")),
                 )
+                chunk_count += 1
             con.execute(
                 """
                 UPDATE documents
-                SET status=?, searchable_pdf=?, page_count=?, text_chars=?,
+                SET status=?, searchable_pdf=?, page_count=?, chunk_count=?, text_chars=?,
                     has_text_layer=?, error=?, indexed_at=?, updated_at=?
                 WHERE id=?
                 """,
@@ -936,6 +1099,7 @@ class Database:
                     status,
                     searchable_pdf,
                     page_count,
+                    chunk_count,
                     text_chars,
                     1 if has_text_layer else 0,
                     error,
@@ -1032,7 +1196,18 @@ class Database:
         rows = list(con.execute("SELECT id FROM chunks WHERE document_id = ?", (document_id,)))
         for row in rows:
             con.execute("DELETE FROM chunks_fts WHERE rowid = ?", (row["id"],))
+        con.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
         con.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        con.execute(
+            "UPDATE documents SET chunk_count = 0 WHERE id = ?",
+            (document_id,),
+        )
+        self._mark_vector_index_dirty(con)
+
+    def _mark_vector_index_dirty(self, con: sqlite3.Connection) -> None:
+        con.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('vector_index_dirty', '1')"
+        )
 
     def fail_document(self, document_id: str, error: str) -> None:
         ts = now_iso()
@@ -1786,6 +1961,331 @@ class Database:
             )
             return [dict(row) for row in rows]
 
+    def chunks_for_embedding(self, document_id: str) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT c.id, c.document_id, c.page, c.ordinal, c.line, c.text,
+                           c.bbox, c.source
+                    FROM chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE c.document_id = ? AND d.deleted = 0
+                    ORDER BY COALESCE(c.page, 0), c.ordinal, c.id
+                    """,
+                    (document_id,),
+                )
+            )
+            return [dict(row) for row in rows]
+
+    def chunks_missing_embeddings(
+        self, document_id: str, model: str, dim: int
+    ) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT c.id, c.document_id, c.page, c.ordinal, c.line, c.text,
+                           c.bbox, c.source
+                    FROM chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    LEFT JOIN chunk_embeddings e
+                      ON e.chunk_id = c.id
+                     AND e.model = ?
+                     AND e.dim = ?
+                    WHERE c.document_id = ?
+                      AND d.deleted = 0
+                      AND e.chunk_id IS NULL
+                    ORDER BY COALESCE(c.page, 0), c.ordinal, c.id
+                    """,
+                    (model, int(dim), document_id),
+                )
+            )
+            return [dict(row) for row in rows]
+
+    def delete_document_embeddings(self, document_id: str) -> None:
+        with self._lock, self.connect() as con:
+            con.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
+            self._mark_vector_index_dirty(con)
+
+    def upsert_chunk_embeddings(
+        self,
+        document_id: str,
+        model: str,
+        dim: int,
+        rows: Iterable[tuple[int, bytes]],
+    ) -> int:
+        ts = now_iso()
+        payload = [
+            (int(chunk_id), document_id, int(dim), model, sqlite3.Binary(vector), ts, ts)
+            for chunk_id, vector in rows
+        ]
+        if not payload:
+            return 0
+        with self._lock, self.connect() as con:
+            con.executemany(
+                """
+                INSERT INTO chunk_embeddings(
+                    chunk_id, document_id, dim, model, vector, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    document_id=excluded.document_id,
+                    dim=excluded.dim,
+                    model=excluded.model,
+                    vector=excluded.vector,
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+            self._mark_vector_index_dirty(con)
+        return len(payload)
+
+    def embedding_rows(self, model: str, dim: int) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT e.chunk_id, e.document_id, e.vector
+                    FROM chunk_embeddings e
+                    JOIN chunks c ON c.id = e.chunk_id
+                    JOIN documents d ON d.id = e.document_id
+                    WHERE d.deleted = 0
+                      AND e.model = ?
+                      AND e.dim = ?
+                    ORDER BY e.chunk_id
+                    """,
+                    (model, int(dim)),
+                )
+            )
+            return [dict(row) for row in rows]
+
+    def document_embedding_rows(
+        self, document_id: str, model: str, dim: int
+    ) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT e.chunk_id, e.document_id, e.vector
+                    FROM chunk_embeddings e
+                    JOIN chunks c ON c.id = e.chunk_id
+                    JOIN documents d ON d.id = e.document_id
+                    WHERE e.document_id = ?
+                      AND d.deleted = 0
+                      AND e.model = ?
+                      AND e.dim = ?
+                    ORDER BY COALESCE(c.page, 0), c.ordinal, c.id
+                    """,
+                    (document_id, model, int(dim)),
+                )
+            )
+            return [dict(row) for row in rows]
+
+    def rows_for_chunk_ids(
+        self,
+        chunk_ids: Iterable[int],
+        scope: str | None = None,
+        document_id: str | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        ids = [int(chunk_id) for chunk_id in chunk_ids]
+        if not ids:
+            return {}
+        filter_sql, filter_params = search_document_filters(scope, document_id)
+        result: dict[int, dict[str, Any]] = {}
+        with self.connect() as con:
+            for start in range(0, len(ids), 900):
+                batch = ids[start : start + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = list(
+                    con.execute(
+                        f"""
+                        SELECT c.id AS match_id, c.document_id, c.page, c.ordinal, c.line,
+                               c.text AS snippet, c.source,
+                               d.rel_path, d.title, d.ext, d.status, d.searchable_pdf,
+                               d.citation, d.publication_status, d.publication_info
+                        FROM chunks c
+                        JOIN documents d ON d.id = c.document_id
+                        WHERE c.id IN ({placeholders}) AND {filter_sql}
+                        """,
+                        (*batch, *filter_params),
+                    )
+                )
+                result.update({int(row["match_id"]): dict(row) for row in rows})
+            return result
+
+    def enqueue_vector_jobs(
+        self,
+        model: str,
+        dim: int,
+        *,
+        force: bool = False,
+        limit: int = 10000,
+    ) -> int:
+        ts = now_iso()
+        queued = 0
+        with self._lock, self.connect() as con:
+            rows = list(
+                con.execute(
+                    """
+                    SELECT d.id
+                    FROM documents d
+                    WHERE d.deleted = 0
+                      AND d.text_chars > 0
+                      AND d.chunk_count > 0
+                      AND (
+                          ? = 1
+                          OR (
+                              SELECT COUNT(*)
+                              FROM chunk_embeddings e
+                              WHERE e.document_id = d.id
+                                AND e.model = ?
+                                AND e.dim = ?
+                          ) < d.chunk_count
+                      )
+                    ORDER BY d.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (1 if force else 0, model, int(dim), int(limit)),
+                )
+            )
+            for row in rows:
+                existing = con.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE document_id = ? AND type = 'vector' AND status IN ('queued', 'processing')
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                if force:
+                    con.execute(
+                        """
+                        DELETE FROM chunk_embeddings
+                        WHERE document_id = ? AND model = ? AND dim = ?
+                        """,
+                        (row["id"], model, int(dim)),
+                    )
+                con.execute(
+                    """
+                    INSERT INTO jobs(document_id, type, status, priority, message, created_at, updated_at)
+                    VALUES(?, 'vector', 'queued', 160, 'Queued for fuzzy index', ?, ?)
+                    """,
+                    (row["id"], ts, ts),
+                )
+                queued += 1
+        return queued
+
+    def vector_stats(self, model: str, dim: int) -> dict[str, Any]:
+        with self.connect() as con:
+            documents = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS documents,
+                    COALESCE(SUM(chunk_count), 0) AS chunks
+                FROM documents
+                WHERE deleted = 0 AND text_chars > 0 AND chunk_count > 0
+                """
+            ).fetchone()
+            embeddings = con.execute(
+                """
+                SELECT COUNT(*) AS embeddings
+                FROM chunk_embeddings
+                WHERE model = ? AND dim = ?
+                """,
+                (model, int(dim)),
+            ).fetchone()
+            embedded_documents = con.execute(
+                """
+                SELECT COUNT(*) AS embedded_documents
+                FROM documents d
+                WHERE d.deleted = 0
+                  AND d.text_chars > 0
+                  AND d.chunk_count > 0
+                  AND (
+                      SELECT COUNT(*)
+                      FROM chunk_embeddings e
+                      WHERE e.document_id = d.id
+                        AND e.model = ?
+                        AND e.dim = ?
+                  ) >= d.chunk_count
+                """,
+                (model, int(dim)),
+            ).fetchone()
+            jobs = con.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE jobs.status = 'queued') AS queued,
+                    COUNT(*) FILTER (WHERE jobs.status = 'processing') AS processing,
+                    COUNT(*) FILTER (
+                        WHERE jobs.status = 'failed'
+                          AND jobs.id = (
+                              SELECT MAX(latest.id)
+                              FROM jobs latest
+                              WHERE latest.document_id = jobs.document_id
+                                AND latest.type = 'vector'
+                          )
+                    ) AS failed
+                FROM jobs
+                JOIN documents ON documents.id = jobs.document_id
+                WHERE jobs.type = 'vector'
+                  AND documents.deleted = 0
+                """
+            ).fetchone()
+            meta_rows = con.execute(
+                "SELECT key, value FROM meta WHERE key LIKE 'vector_index_%'"
+            ).fetchall()
+        meta = {row["key"]: row["value"] for row in meta_rows}
+        return {
+            "model": model,
+            "dimension": int(dim),
+            "documents": int(documents["documents"] or 0) if documents else 0,
+            "embedded_documents": int(embedded_documents["embedded_documents"] or 0)
+            if embedded_documents
+            else 0,
+            "chunks": int(documents["chunks"] or 0) if documents else 0,
+            "embeddings": int(embeddings["embeddings"] or 0) if embeddings else 0,
+            "queued": int(jobs["queued"] or 0) if jobs else 0,
+            "processing": int(jobs["processing"] or 0) if jobs else 0,
+            "failed": int(jobs["failed"] or 0) if jobs else 0,
+            "index_count": int(meta.get("vector_index_count") or 0),
+            "index_document_count": int(meta.get("vector_index_document_count") or 0),
+            "index_type": meta.get("vector_index_type") or "",
+            "index_model": meta.get("vector_index_model") or "",
+            "index_dim": int(meta.get("vector_index_dim") or 0),
+            "index_updated_at": meta.get("vector_index_updated_at"),
+            "index_dirty": meta.get("vector_index_dirty") == "1",
+            "index_error": meta.get("vector_index_error") or "",
+        }
+
+    def save_vector_index_state(
+        self,
+        *,
+        count: int,
+        index_type: str,
+        model: str,
+        dim: int,
+        document_count: int = 0,
+        error: str | None = None,
+    ) -> None:
+        ts = now_iso()
+        values = {
+            "vector_index_count": str(max(0, int(count))),
+            "vector_index_document_count": str(max(0, int(document_count))),
+            "vector_index_type": index_type,
+            "vector_index_model": model,
+            "vector_index_dim": str(int(dim)),
+            "vector_index_updated_at": ts,
+            "vector_index_dirty": "0" if not error else "1",
+            "vector_index_error": error or "",
+        }
+        with self._lock, self.connect() as con:
+            con.executemany(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                list(values.items()),
+            )
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as con:
             row = con.execute(
@@ -1898,6 +2398,9 @@ def normalize_search_mode(value: str | None) -> str:
         "file": "document",
         "same-file": "document",
         "same_document": "document",
+        "fuzzy": "fuzzy",
+        "semantic": "fuzzy",
+        "vector": "fuzzy",
     }
     return aliases.get(normalized, "basic")
 

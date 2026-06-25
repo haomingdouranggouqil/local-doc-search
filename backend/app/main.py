@@ -14,19 +14,21 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from .config import get_settings
-from .database import Database
+from .database import Database, normalize_search_mode
 from .indexer import DocumentIndexer
 from .pdf_preview import render_highlighted_page_png
 from .quota import current_quota_day
 from .resources import ResourcePolicy
 from .runtime_config import write_runtime_secrets
 from .scanner import DocumentScanner, run_scan_loop, run_worker_loop
+from .vector_search import VectorSearchService, VectorSearchUnavailable
 
 settings = get_settings()
 db = Database(settings.db_path, settings.sqlite_journal_mode)
 resources = ResourcePolicy(settings)
 scanner = DocumentScanner(settings, db, resources)
 indexer = DocumentIndexer(settings, db, resources)
+vector_indexer = VectorSearchService(settings, db)
 stop_event = threading.Event()
 threads: list[threading.Thread] = []
 
@@ -34,6 +36,7 @@ threads: list[threading.Thread] = []
 class TokenConfigPayload(BaseModel):
     paddleocr_api_token: str | None = None
     deepseek_api_key: str | None = None
+    siliconflow_api_key: str | None = None
 
 
 @asynccontextmanager
@@ -45,8 +48,8 @@ async def lifespan(app: FastAPI):
     if settings.app_role in {"worker", "all"}:
         requeued = db.requeue_interrupted_jobs()
         if requeued:
-            db.record_event("job_requeue", f"Requeued interrupted OCR jobs: {requeued}")
-        targets.append((lambda: run_worker_loop(indexer, db, stop_event), "worker"))
+            db.record_event("job_requeue", f"Requeued interrupted jobs: {requeued}")
+        targets.append((lambda: run_worker_loop(indexer, db, stop_event, vector_indexer), "worker"))
 
     for target, name in targets:
         thread = threading.Thread(target=target, name=name, daemon=True)
@@ -95,6 +98,7 @@ def stats() -> dict[str, Any]:
         },
     }
     data["resources"] = resources.as_dict()
+    data["vector"] = vector_indexer.status()
     return data
 
 
@@ -109,6 +113,10 @@ def configure_tokens(payload: TokenConfigPayload) -> dict[str, Any]:
         token = payload.deepseek_api_key.strip()
         if token:
             updates["deepseek_api_key"] = token
+    if payload.siliconflow_api_key is not None:
+        token = payload.siliconflow_api_key.strip()
+        if token:
+            updates["siliconflow_api_key"] = token
     if not updates:
         raise HTTPException(status_code=400, detail="no token provided")
     write_runtime_secrets(settings.runtime_config_path, updates)
@@ -128,11 +136,35 @@ def search(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    page = db.search_page(q, limit=limit, offset=offset, scope=scope, mode=mode)
+    search_mode = normalize_search_mode(mode)
+    if search_mode == "fuzzy":
+        try:
+            hits = vector_indexer.search(q, scope=scope, top_k=offset + limit + 1)
+        except VectorSearchUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        page_results = hits[offset : offset + limit + 1]
+        has_more = len(page_results) > limit
+        results = page_results[:limit]
+        page = {
+            "results": results,
+            "count": len(results),
+            "returned_count": len(results),
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + len(results) if has_more else None,
+        }
+        return {
+            "query": q,
+            "scope": scope,
+            "mode": search_mode,
+            **page,
+        }
+    page = db.search_page(q, limit=limit, offset=offset, scope=scope, mode=search_mode)
     return {
         "query": q,
         "scope": scope,
-        "mode": mode,
+        "mode": search_mode,
         **page,
         "results": [dict(row) for row in page["results"]],
     }
@@ -146,8 +178,15 @@ def search_groups(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    page = db.search_groups_page(q, limit=limit, offset=offset, scope=scope, mode=mode)
-    return {"query": q, "scope": scope, "mode": mode, **page}
+    search_mode = normalize_search_mode(mode)
+    if search_mode == "fuzzy":
+        try:
+            page = vector_indexer.search_groups_page(q, limit=limit, offset=offset, scope=scope)
+        except VectorSearchUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        return {"query": q, "scope": scope, "mode": search_mode, **page}
+    page = db.search_groups_page(q, limit=limit, offset=offset, scope=scope, mode=search_mode)
+    return {"query": q, "scope": scope, "mode": search_mode, **page}
 
 
 @app.get("/api/search/document/{document_id}")
@@ -160,10 +199,41 @@ def search_document(
 ) -> dict[str, Any]:
     if db.get_document(document_id) is None:
         raise HTTPException(status_code=404, detail="document not found")
+    search_mode = normalize_search_mode(mode)
+    if search_mode == "fuzzy":
+        try:
+            page = vector_indexer.search_document_page(
+                q, document_id=document_id, limit=limit, offset=offset
+            )
+        except VectorSearchUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        return {"query": q, "document_id": document_id, "mode": search_mode, **page}
     page = db.search_document_page(
-        q, document_id=document_id, limit=limit, offset=offset, mode=mode
+        q, document_id=document_id, limit=limit, offset=offset, mode=search_mode
     )
-    return {"query": q, "document_id": document_id, "mode": mode, **page}
+    return {"query": q, "document_id": document_id, "mode": search_mode, **page}
+
+
+@app.post("/api/vector/rebuild")
+def rebuild_vector_index(
+    force: bool = Query(default=False),
+    limit: int = Query(default=10000, ge=1, le=50000),
+) -> dict[str, Any]:
+    try:
+        queued = vector_indexer.enqueue_missing(force=force, limit=limit)
+    except VectorSearchUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if queued:
+        db.record_event("vector", f"Queued fuzzy index jobs: {queued}")
+    return {"queued": queued, "status": vector_indexer.status()}
+
+
+@app.post("/api/vector/cancel")
+def cancel_vector_index() -> dict[str, Any]:
+    cancelled = db.cancel_vector_jobs("Cancelled by user")
+    if cancelled:
+        db.record_event("cancel", f"Cancelled fuzzy index jobs: {cancelled}")
+    return {"cancelled": cancelled, "status": vector_indexer.status()}
 
 
 @app.get("/api/categories")

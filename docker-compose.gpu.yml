@@ -1,9 +1,11 @@
 services:
   backend:
+    gpus: all
     environment:
       OCR_ENGINE: api
       OCR_DEVICE: api
   worker:
+    gpus: all
     environment:
       OCR_ENGINE: api
       OCR_DEVICE: api

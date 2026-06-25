@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     document_root: Path = Field(default=Path("/library"))
     state_dir: Path = Field(default=Path("/data"))
-    sqlite_journal_mode: str = "DELETE"
+    sqlite_journal_mode: str = "WAL"
 
     exclude_dirs: str = (
         ".docsearch,.git,.svn,backend,frontend,scripts,node_modules,"
@@ -67,6 +67,20 @@ class Settings(BaseSettings):
     publication_extract_enabled: bool = True
     local_open_enabled: bool = True
 
+    siliconflow_api_key: str = ""
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+    siliconflow_timeout_seconds: int = 60
+    siliconflow_retries: int = 3
+    siliconflow_embedding_batch_size: int = 0
+    siliconflow_embedding_concurrency: int = 120
+    siliconflow_requests_per_second: float = 30.0
+    siliconflow_tokens_per_minute: int = 1000000
+    siliconflow_max_request_tokens: int = 30000
+    embedding_dimension: int = 512
+    vector_index_enabled: bool = True
+    vector_search_candidates: int = 5000
+    vector_job_concurrency: int = 12
+
     app_name: str = "本地资料检索"
     app_role: str = "api"
 
@@ -87,6 +101,10 @@ class Settings(BaseSettings):
         return self.state_dir / "tmp"
 
     @property
+    def vector_dir(self) -> Path:
+        return self.state_dir / "vector"
+
+    @property
     def runtime_config_path(self) -> Path:
         return self.state_dir / "runtime-config.json"
 
@@ -103,10 +121,17 @@ class Settings(BaseSettings):
         )
 
     @property
+    def effective_siliconflow_api_key(self) -> str:
+        return self.siliconflow_api_key.strip() or runtime_secret(
+            self.runtime_config_path, "siliconflow_api_key"
+        )
+
+    @property
     def token_status(self) -> dict[str, bool]:
         return {
             "paddleocr_api_token_configured": bool(self.effective_paddleocr_api_token),
             "deepseek_api_key_configured": bool(self.effective_deepseek_api_key),
+            "siliconflow_api_key_configured": bool(self.effective_siliconflow_api_key),
         }
 
     @property
@@ -138,7 +163,14 @@ class Settings(BaseSettings):
         }
 
     def ensure_dirs(self) -> None:
-        for path in (self.state_dir, self.db_path.parent, self.ocr_dir, self.preview_dir, self.temp_dir):
+        for path in (
+            self.state_dir,
+            self.db_path.parent,
+            self.ocr_dir,
+            self.preview_dir,
+            self.temp_dir,
+            self.vector_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 

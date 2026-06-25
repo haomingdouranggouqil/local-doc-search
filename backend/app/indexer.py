@@ -59,6 +59,13 @@ class DocumentIndexer:
             )
             if path.suffix.lower() == ".pdf":
                 self._extract_publication_info(document_id, doc["rel_path"], result, job_id)
+            if self.settings.vector_index_enabled and result.text_chars > 0:
+                self.db.enqueue_job(
+                    document_id,
+                    job_type="vector",
+                    priority=160,
+                    message="Queued for fuzzy index",
+                )
             if job_id is not None:
                 self.db.update_job(job_id, status="done", progress=1, message="Done")
             self.db.record_event("index", f"Indexed: {doc['rel_path']}", document_id, doc["rel_path"])

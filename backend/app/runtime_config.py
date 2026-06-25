@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-SECRET_KEYS = {"paddleocr_api_token", "deepseek_api_key"}
+SECRET_KEYS = {"paddleocr_api_token", "deepseek_api_key", "siliconflow_api_key"}
 
 
 def read_runtime_config(path: Path) -> dict[str, Any]:
@@ -40,4 +40,5 @@ def write_runtime_secrets(path: Path, updates: dict[str, str]) -> dict[str, bool
     return {
         "paddleocr_api_token_configured": bool(str(current.get("paddleocr_api_token") or "").strip()),
         "deepseek_api_key_configured": bool(str(current.get("deepseek_api_key") or "").strip()),
+        "siliconflow_api_key_configured": bool(str(current.get("siliconflow_api_key") or "").strip()),
     }

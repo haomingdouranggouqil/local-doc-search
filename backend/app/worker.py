@@ -8,6 +8,7 @@ from .database import Database
 from .indexer import DocumentIndexer
 from .resources import ResourcePolicy
 from .scanner import run_worker_loop
+from .vector_search import VectorSearchService
 
 
 def main() -> None:
@@ -15,6 +16,7 @@ def main() -> None:
     db = Database(settings.db_path, settings.sqlite_journal_mode)
     resources = ResourcePolicy(settings)
     indexer = DocumentIndexer(settings, db, resources)
+    vector_indexer = VectorSearchService(settings, db)
     stop_event = threading.Event()
 
     def stop(*_args) -> None:
@@ -25,8 +27,8 @@ def main() -> None:
 
     requeued = db.requeue_interrupted_jobs()
     if requeued:
-        db.record_event("job_requeue", f"Requeued interrupted OCR jobs: {requeued}")
-    run_worker_loop(indexer, db, stop_event)
+        db.record_event("job_requeue", f"Requeued interrupted jobs: {requeued}")
+    run_worker_loop(indexer, db, stop_event, vector_indexer)
 
 
 if __name__ == "__main__":

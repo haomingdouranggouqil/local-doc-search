@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 try:
@@ -182,13 +183,56 @@ def run_scan_loop(scanner: DocumentScanner, stop_event: threading.Event) -> None
         observer.join(timeout=10)
 
 
-def run_worker_loop(indexer, db: Database, stop_event: threading.Event) -> None:
-    while not stop_event.is_set():
-        job = db.claim_next_job()
-        if job is None:
-            stop_event.wait(1.5)
-            continue
-        try:
-            indexer.process(job["document_id"], job["id"])
-        except Exception:
-            time.sleep(1)
+def run_worker_loop(indexer, db: Database, stop_event: threading.Event, vector_indexer=None) -> None:
+    vector_limit = 1
+    if vector_indexer is not None:
+        vector_limit = max(1, int(getattr(vector_indexer.settings, "vector_job_concurrency", 1) or 1))
+    active_vector_jobs = {}
+    with ThreadPoolExecutor(max_workers=vector_limit) as vector_executor:
+        while not stop_event.is_set():
+            done = [future for future in active_vector_jobs if future.done()]
+            for future in done:
+                active_vector_jobs.pop(future, None)
+                try:
+                    future.result()
+                except Exception as exc:
+                    if exc.__class__.__name__ == "VectorRemoteUnavailable":
+                        stop_event.wait(120)
+                    else:
+                        time.sleep(1)
+
+            if len(active_vector_jobs) >= vector_limit:
+                wait(active_vector_jobs.keys(), timeout=1.0, return_when=FIRST_COMPLETED)
+                continue
+
+            job = db.claim_next_job()
+            if job is None:
+                stop_event.wait(1.5)
+                continue
+            try:
+                if job["type"] == "vector":
+                    if vector_indexer is None:
+                        db.update_job(
+                            job["id"],
+                            status="failed",
+                            progress=1,
+                            message="Fuzzy index unavailable",
+                            error="vector indexer is not configured",
+                        )
+                    else:
+                        future = vector_executor.submit(
+                            vector_indexer.process_document,
+                            job["document_id"],
+                            job["id"],
+                        )
+                        active_vector_jobs[future] = job["id"]
+                else:
+                    indexer.process(job["document_id"], job["id"])
+            except Exception as exc:
+                if exc.__class__.__name__ == "VectorRemoteUnavailable":
+                    stop_event.wait(120)
+                else:
+                    time.sleep(1)
+
+        for future in active_vector_jobs:
+            future.cancel()

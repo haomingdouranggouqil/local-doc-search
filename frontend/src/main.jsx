@@ -27,6 +27,7 @@ const SEARCH_MODES = [
   { value: 'basic', label: '普通' },
   { value: 'line', label: '同一行' },
   { value: 'document', label: '同一文件' },
+  { value: 'fuzzy', label: '模糊' },
 ];
 
 function App() {
@@ -46,20 +47,28 @@ function App() {
   const [citationFor, setCitationFor] = useState(null);
   const [textContext, setTextContext] = useState(null);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState('');
   const [hasMoreResults, setHasMoreResults] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
+  const [vectorAction, setVectorAction] = useState('');
+  const [vectorError, setVectorError] = useState('');
   const [retryFailedOnScan, setRetryFailedOnScan] = useState(false);
   const [jobAction, setJobAction] = useState({ id: null, type: '' });
   const [failedAction, setFailedAction] = useState({ id: null, type: '' });
-  const [tokenForm, setTokenForm] = useState({ paddleocr_api_token: '', deepseek_api_key: '' });
+  const [tokenForm, setTokenForm] = useState({
+    paddleocr_api_token: '',
+    deepseek_api_key: '',
+    siliconflow_api_key: '',
+  });
   const [tokenSaveState, setTokenSaveState] = useState({ saving: false, error: '', saved: false });
   const [openStatus, setOpenStatus] = useState(null);
   const searchRequestRef = useRef(0);
+  const refreshStatusPromiseRef = useRef(null);
 
   useEffect(() => {
     refreshStatus();
-    const timer = window.setInterval(refreshStatus, 4000);
+    const timer = window.setInterval(refreshStatus, 10000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -70,6 +79,7 @@ function App() {
       setExpandedDocuments({});
       setDocumentHits({});
       setSelected(null);
+      setSearchError('');
       setHasMoreResults(false);
       setLoadingMore(false);
       return;
@@ -88,6 +98,15 @@ function App() {
         setSelected(null);
         setHasMoreResults(Boolean(data.has_more));
         setCitationFor(null);
+        setSearchError('');
+      } catch (error) {
+        if (requestId !== searchRequestRef.current) return;
+        setResultGroups([]);
+        setExpandedDocuments({});
+        setDocumentHits({});
+        setSelected(null);
+        setHasMoreResults(false);
+        setSearchError(error.message || '搜索失败');
       } finally {
         if (requestId === searchRequestRef.current) setSearching(false);
       }
@@ -110,6 +129,8 @@ function App() {
   }, [selected?.document_id]);
 
   async function refreshStatus() {
+    if (refreshStatusPromiseRef.current) return refreshStatusPromiseRef.current;
+    refreshStatusPromiseRef.current = (async () => {
     const [statsData, jobsData, failedData, eventsData, categoriesData] = await Promise.all([
       getJson(`${API}/stats`).catch(() => null),
       getJson(`${API}/jobs`).catch(() => ({ jobs: [] })),
@@ -125,6 +146,14 @@ function App() {
     setCategories(categoriesData.categories || [{ path: '', label: '全部资料' }]);
   }
 
+    )();
+    try {
+      await refreshStatusPromiseRef.current;
+    } finally {
+      refreshStatusPromiseRef.current = null;
+    }
+  }
+
   async function triggerScan() {
     setScanLoading(true);
     try {
@@ -132,6 +161,34 @@ function App() {
       await refreshStatus();
     } finally {
       setScanLoading(false);
+    }
+  }
+
+  async function triggerVectorRebuild(force = false) {
+    if (vectorAction) return;
+    setVectorAction('start');
+    setVectorError('');
+    try {
+      await postJson(`${API}/vector/rebuild?force=${force ? 'true' : 'false'}`);
+      await refreshStatus();
+    } catch (error) {
+      setVectorError(error.message || '无法开始构建模糊索引');
+    } finally {
+      setVectorAction('');
+    }
+  }
+
+  async function cancelVectorIndex() {
+    if (vectorAction) return;
+    setVectorAction('stop');
+    setVectorError('');
+    try {
+      await postJson(`${API}/vector/cancel`);
+      await refreshStatus();
+    } catch (error) {
+      setVectorError(error.message || '无法中止模糊索引构建');
+    } finally {
+      setVectorAction('');
     }
   }
 
@@ -175,8 +232,9 @@ function App() {
       await postJson(`${API}/config/tokens`, {
         paddleocr_api_token: tokenForm.paddleocr_api_token,
         deepseek_api_key: tokenForm.deepseek_api_key,
+        siliconflow_api_key: tokenForm.siliconflow_api_key,
       });
-      setTokenForm({ paddleocr_api_token: '', deepseek_api_key: '' });
+      setTokenForm({ paddleocr_api_token: '', deepseek_api_key: '', siliconflow_api_key: '' });
       await refreshStatus();
       setTokenSaveState({ saving: false, error: '', saved: true });
       window.setTimeout(() => setTokenSaveState((current) => ({ ...current, saved: false })), 2400);
@@ -199,6 +257,9 @@ function App() {
         return [...current, ...nextGroups.filter((item) => !seen.has(item.document_id))];
       });
       setHasMoreResults(Boolean(data.has_more));
+      setSearchError('');
+    } catch (error) {
+      if (requestId === searchRequestRef.current) setSearchError(error.message || '加载更多结果失败');
     } finally {
       if (requestId === searchRequestRef.current) setLoadingMore(false);
     }
@@ -294,6 +355,8 @@ function App() {
   }, [selected, query]);
   const activeSearchMode = SEARCH_MODES.find((mode) => mode.value === searchMode) || SEARCH_MODES[0];
   const showSearchProgress = Boolean(query.trim() && searching);
+  const vectorActive = vectorIndexActive(stats);
+  const missingSiliconFlowKey = needsSiliconFlowKey(stats);
 
   return (
     <main className="app-shell">
@@ -304,7 +367,7 @@ function App() {
           </div>
           <div>
             <h1>本地资料检索</h1>
-            <p>PP-OCRv6 API · 本机索引</p>
+            <p>PP-OCRv6 API · SiliconFlow 向量</p>
           </div>
         </div>
 
@@ -319,6 +382,12 @@ function App() {
             onSave={saveApiTokens}
           />
           <Metric icon={<Gauge size={18} />} label="资源策略" value={resourceLimitLabel(stats)} tone="blue" />
+          <Metric
+            icon={<Search size={18} />}
+            label="模糊索引"
+            value={vectorIndexLabelDetailed(stats)}
+            tone={vectorIndexReady(stats) ? 'green' : 'blue'}
+          />
         </section>
 
         <div className="scan-controls">
@@ -335,6 +404,44 @@ function App() {
             />
             <span>重试失败文件</span>
           </label>
+          <div className="vector-settings" aria-label="模糊索引设置">
+            <div className="vector-setting-head">
+              <span>
+                <Search size={15} />
+                模糊索引
+              </span>
+              <small>{vectorControlStatusDetailed(stats)}</small>
+            </div>
+            {missingSiliconFlowKey && (
+              <SiliconFlowKeyForm
+                tokenForm={tokenForm}
+                tokenSaveState={tokenSaveState}
+                onTokenChange={setTokenForm}
+                onSave={saveApiTokens}
+              />
+            )}
+            <div className="vector-action-row">
+              <button
+                className="vector-action-button start"
+                type="button"
+                onClick={() => triggerVectorRebuild(false)}
+                disabled={Boolean(vectorAction) || vectorActive || !stats?.vector?.enabled || missingSiliconFlowKey}
+              >
+                {vectorAction === 'start' ? <Loader2 className="spin" size={14} /> : <Search size={14} />}
+                {vectorStartLabel(stats, vectorActive)}
+              </button>
+              <button
+                className="vector-action-button stop"
+                type="button"
+                onClick={cancelVectorIndex}
+                disabled={Boolean(vectorAction) || !vectorActive}
+              >
+                {vectorAction === 'stop' ? <Loader2 className="spin" size={14} /> : <XCircle size={14} />}
+                中止构建
+              </button>
+            </div>
+            {vectorError && <div className="vector-error">{vectorError}</div>}
+          </div>
         </div>
 
         <section className="failed-documents">
@@ -502,6 +609,12 @@ function App() {
 
         <div className="results-list">
           {showSearchProgress && <SearchProgress query={query} />}
+          {!showSearchProgress && searchError && (
+            <div className="search-error">
+              <AlertTriangle size={18} />
+              <span>{searchError}</span>
+            </div>
+          )}
           {!showSearchProgress && resultGroups.map((group) => {
             const documentId = group.document_id;
             const expanded = Boolean(expandedDocuments[documentId]);
@@ -608,7 +721,7 @@ function App() {
               </React.Fragment>
             );
           })}
-          {!showSearchProgress && query.trim() && !searching && resultGroups.length === 0 && (
+          {!showSearchProgress && query.trim() && !searching && !searchError && resultGroups.length === 0 && (
             <div className="empty-state">
               <FileSearch size={24} />
               <span>没有命中结果</span>
@@ -739,6 +852,32 @@ function OcrDeviceMetric({ stats, tokenForm, tokenSaveState, onTokenChange, onSa
           {tokenSaveState.saved && <small className="token-ok">已保存</small>}
         </div>
       </div>
+    </form>
+  );
+}
+
+function SiliconFlowKeyForm({ tokenForm, tokenSaveState, onTokenChange, onSave }) {
+  const canSave = Boolean(tokenForm.siliconflow_api_key.trim()) && !tokenSaveState.saving;
+  return (
+    <form className="vector-token-form" onSubmit={onSave}>
+      <label>
+        <span>请填写 SiliconFlow API Key</span>
+        <input
+          type="password"
+          value={tokenForm.siliconflow_api_key}
+          onChange={(event) =>
+            onTokenChange((current) => ({ ...current, siliconflow_api_key: event.target.value }))
+          }
+          placeholder="SILICONFLOW_API_KEY"
+          autoComplete="off"
+        />
+      </label>
+      <button type="submit" disabled={!canSave}>
+        {tokenSaveState.saving ? <Loader2 className="spin" size={13} /> : null}
+        保存
+      </button>
+      {tokenSaveState.error && <small className="token-error">{tokenSaveState.error}</small>}
+      {tokenSaveState.saved && <small className="token-ok">已保存</small>}
     </form>
   );
 }
@@ -904,6 +1043,12 @@ function searchSummaryLabel(query, count, hasMore) {
 }
 
 function searchModeDetail(activeSearchMode, scope, stats) {
+  if (activeSearchMode.value === 'fuzzy') {
+    const vector = stats?.vector;
+    const source = vectorProviderLabel(vector);
+    const base = vector?.available ? `FAISS 4bit 向量索引 · ${source}` : `模糊索引未就绪 · ${source}`;
+    return scope ? `${base} · 范围：${scope}` : base;
+  }
   const indexLabel = scope ? `范围：${scope}` : stats?.fts_tokenizer === 'trigram' ? '中文连续匹配' : '全文索引';
   if (activeSearchMode.value === 'basic') return indexLabel;
   return `${activeSearchMode.label} · ${indexLabel}`;
@@ -923,6 +1068,155 @@ function resourceLimitLabel(stats) {
   const limits = stats?.resources?.limits;
   if (!limits) return '自动';
   return `${limits.max_file_mb}MB`;
+}
+
+function vectorIndexLabel(stats) {
+  const vector = stats?.vector;
+  if (!vector?.enabled) return '已关闭';
+  const embedded = Number(vector.embedded_documents || 0);
+  const total = Number(vector.documents || 0);
+  if (vector.processing || vector.queued) {
+    return `${embedded}/${total} 处理中`;
+  }
+  return `${embedded}/${total}`;
+}
+
+function vectorIndexReady(stats) {
+  const vector = stats?.vector;
+  return Boolean(vector?.available && !vector?.index_dirty);
+}
+
+function vectorIndexActive(stats) {
+  const vector = stats?.vector;
+  return Boolean(Number(vector?.queued || 0) || Number(vector?.processing || 0));
+}
+
+function vectorControlStatus(stats) {
+  const vector = stats?.vector;
+  if (!vector?.enabled) return '已关闭';
+  const source = vectorProviderLabel(vector);
+  const embedded = Number(vector.embedded_documents || 0);
+  const total = Number(vector.documents || 0);
+  const queued = Number(vector.queued || 0);
+  const processing = Number(vector.processing || 0);
+  if (queued || processing) return `${source} · ${embedded}/${total} · 处理中 ${processing}/${queued}`;
+  if (vectorIndexReady(stats)) return `${source} · ${embedded}/${total} · 可搜索`;
+  return `${source} · ${embedded}/${total} · 未就绪`;
+}
+
+function vectorStartLabel(stats, active) {
+  if (active) return '构建中';
+  const vector = stats?.vector;
+  if (!vector?.enabled) return '已关闭';
+  if (needsSiliconFlowKey(stats)) return '先填写 Key';
+  if (vectorIndexReady(stats)) return '更新索引';
+  return Number(vector.embeddings || 0) > 0 ? '继续构建' : '开始构建';
+}
+
+function vectorProviderLabel(vector) {
+  if (vector?.provider === 'siliconflow') return 'SiliconFlow';
+  return vector?.provider === 'api' ? 'API' : '本机';
+}
+
+function needsSiliconFlowKey(stats) {
+  const vector = stats?.vector;
+  if (!vector?.enabled || vector?.provider !== 'siliconflow') return false;
+  const tokens = stats?.ocr?.tokens || {};
+  return !Boolean(vector.api_key_configured || tokens.siliconflow_api_key_configured);
+}
+
+function vectorIndexLabelDetailed(stats) {
+  const vector = stats?.vector;
+  if (!vector?.enabled) return '已关闭';
+  const embedded = Number(vector.embedded_documents || 0);
+  const total = Number(vector.documents || 0);
+  const failed = Number(vector.failed || 0);
+  const job = activeVectorJob(stats);
+  const failedText = failed > 0 ? ` · 失败${failed}` : '';
+  if (vector.processing || vector.queued) {
+    return job
+      ? `${embedded}/${total}${failedText} · 当前${progressPercent(job.progress)}`
+      : `${embedded}/${total}${failedText} · 处理中`;
+  }
+  return `${embedded}/${total}${failedText}`;
+}
+
+function vectorControlStatusDetailed(stats) {
+  const vector = stats?.vector;
+  if (!vector?.enabled) return '已关闭';
+  const source = vectorProviderLabel(vector);
+  const embedded = Number(vector.embedded_documents || 0);
+  const total = Number(vector.documents || 0);
+  const queued = Number(vector.queued || 0);
+  const processing = Number(vector.processing || 0);
+  const failed = Number(vector.failed || 0);
+  const chunks = Number(vector.chunks || 0);
+  const embeddings = Number(vector.embeddings || 0);
+  const requestRate = Number(vector.request_rate_limit_per_second || 0);
+  const batchSize = Number(vector.embedding_batch_size || 0);
+  const concurrency = Number(vector.embedding_concurrency || 0);
+  const tokenLimit = Number(vector.tokens_per_minute_limit || 0);
+  const job = activeVectorJob(stats);
+  const apiIssue = vectorApiIssueLabel(vector);
+  const parts = [`${source}`, `文件 ${embedded}/${total}`];
+  if (requestRate > 0) parts.push(`限速 ${formatRate(requestRate)} 次/秒`);
+  if (concurrency > 0) {
+    parts.push(batchSize > 0 ? `批量 ${batchSize} · 并发 ${concurrency}` : `按 token 打包 · 并发 ${concurrency}`);
+  }
+  if (tokenLimit > 0) parts.push(`TPM ${formatNumber(tokenLimit)}`);
+  if (needsSiliconFlowKey(stats)) parts.push('缺少 API Key');
+  if (apiIssue) parts.push(apiIssue);
+  if (job) {
+    const current = vectorJobProgressText(job);
+    parts.push(current ? `当前 ${progressPercent(job.progress)} (${current})` : `当前 ${progressPercent(job.progress)}`);
+  }
+  if (chunks > 0) parts.push(`行 ${formatNumber(embeddings)}/${formatNumber(chunks)}`);
+  if (failed > 0) parts.push(`失败 ${failed}`);
+  if (queued || processing) parts.push(`队列 ${processing}/${queued}`);
+  if (!queued && !processing && vectorIndexReady(stats)) parts.push('可搜索');
+  if (!queued && !processing && !vectorIndexReady(stats)) parts.push('未完成');
+  return parts.join(' · ');
+}
+
+function activeVectorJob(stats) {
+  const job = stats?.latest_job;
+  if (!job || job.type !== 'vector' || job.status !== 'processing') return null;
+  return job;
+}
+
+function progressPercent(value) {
+  const number = Number(value || 0);
+  const clamped = Math.max(0, Math.min(1, Number.isFinite(number) ? number : 0));
+  return `${Math.round(clamped * 100)}%`;
+}
+
+function formatRate(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return '0';
+  if (Math.abs(number - Math.round(number)) < 0.01) return String(Math.round(number));
+  return number.toFixed(1);
+}
+
+function vectorJobProgressText(job) {
+  const message = String(job?.message || '');
+  const match = message.match(/(\d+)\s*\/\s*(\d+)/);
+  return match ? `${match[1]}/${match[2]}` : '';
+}
+
+function vectorApiIssueLabel(vector) {
+  if (!['api', 'siliconflow'].includes(vector?.provider)) return '';
+  const error = String(vector?.index_error || '').toLowerCase();
+  if (!error) return '';
+  if (error.includes('siliconflow api key')) {
+    return '请填写 SiliconFlow API Key';
+  }
+  if (error.includes('siliconflow')) {
+    return 'SiliconFlow API 不可用';
+  }
+  if (error.includes('health check') || error.includes('http 530') || error.includes('cloudflare tunnel')) {
+    return 'API 不可用，等待恢复';
+  }
+  return '';
 }
 
 function jobLabel(job) {
@@ -979,7 +1273,7 @@ function isGpuReady(stats) {
 
 async function getJson(url) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`GET ${url} failed`);
+  if (!response.ok) throw new Error(await responseErrorMessage(response, `GET ${url} failed`));
   return response.json();
 }
 
@@ -1013,7 +1307,7 @@ async function postJson(url, body) {
       }
     : { method: 'POST' };
   const response = await fetch(url, options);
-  if (!response.ok) throw new Error(`POST ${url} failed`);
+  if (!response.ok) throw new Error(await responseErrorMessage(response, `POST ${url} failed`));
   return response.json();
 }
 

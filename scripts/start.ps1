@@ -1,6 +1,6 @@
 param(
     [ValidateSet("auto", "api", "cpu", "gpu")]
-    [string]$Device = "api"
+    [string]$Device = "auto"
 )
 
 $ErrorActionPreference = "Stop"
@@ -149,11 +149,53 @@ function Wait-HttpOk {
     throw "$Name did not become healthy at $Uri."
 }
 
+function Test-NvidiaGpuPresent {
+    $NvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $NvidiaSmi) {
+        return $false
+    }
+    nvidia-smi *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Get-ComposeArgs {
+    $Args = @("-f", "docker-compose.yml")
+    $UseGpu = $false
+    if ($Device -eq "gpu") {
+        $UseGpu = $true
+    } elseif ($Device -eq "auto") {
+        $UseGpu = Test-NvidiaGpuPresent
+    }
+    if ($UseGpu) {
+        $Args += @("-f", "docker-compose.gpu.yml")
+        Write-Log "NVIDIA GPU detected; starting Docker Compose with GPU access."
+    } else {
+        Write-Log "Starting Docker Compose without GPU access."
+    }
+    return $Args
+}
+
+function Start-ComposeStack {
+    $ComposeArgs = Get-ComposeArgs
+    docker compose @ComposeArgs up -d --build
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+    if ($ComposeArgs -contains "docker-compose.gpu.yml") {
+        Write-Log "GPU compose startup failed; retrying without GPU access."
+        docker compose -f docker-compose.yml up -d --build
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+    }
+    throw "Docker Compose startup failed."
+}
+
 Start-OpenHelper
 Wait-DockerReady
 
 Write-Log "Starting API OCR stack."
-docker compose up -d --build
+Start-ComposeStack
 
 Start-OpenHelper
 Wait-HttpOk -Uri "http://127.0.0.1:8000/api/health" -Name "Backend API"
